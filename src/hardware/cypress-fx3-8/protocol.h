@@ -28,7 +28,7 @@
 #include <libsigrok/libsigrok.h>
 #include "libsigrok-internal.h"
 
-#define LOG_PREFIX "cypress-fx3"
+#define LOG_PREFIX "cypress-fx3-8"
 
 #define USB_INTERFACE		0
 #define USB_CONFIGURATION	1
