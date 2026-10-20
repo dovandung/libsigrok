@@ -318,7 +318,7 @@ static int dev_open(struct sr_dev_inst *sdi)
 		g_usleep(300 * 1000);
 		timediff_ms = 0;
 		while (timediff_ms < MAX_RENUM_DELAY_MS) {
-			if ((ret = cypress_fx3_dev_open(sdi, di)) == SR_OK)
+			if ((ret = cypress_fx3_8_dev_open(sdi, di)) == SR_OK)
 				break;
 			g_usleep(100 * 1000);
 
@@ -333,7 +333,7 @@ static int dev_open(struct sr_dev_inst *sdi)
 		sr_info("Device came back after %" PRIi64 "ms.", timediff_ms);
 	} else {
 		sr_info("Firmware upload was not needed.");
-		ret = cypress_fx3_dev_open(sdi, di);
+		ret = cypress_fx3_8_dev_open(sdi, di);
 	}
 
 	if (ret != SR_OK) {
@@ -494,7 +494,7 @@ static int config_list(uint32_t key, GVariant **data,
 
 static int cypress_fx3_8_acquisition_stop(struct sr_dev_inst *sdi)
 {
-	cypress_fx3_abort_acquisition(sdi->priv);
+	cypress_fx3_8_abort_acquisition(sdi->priv);
 
 	return SR_OK;
 }
