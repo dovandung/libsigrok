@@ -26,6 +26,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* SIMD for the 2/4-channel unpack: SSE2 is baseline on every x86-64 CPU and
+ * NEON on every ARM64 one; anything else uses the portable loops. */
+#if defined(__SSE2__) || defined(_M_X64) || \
+	(defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <emmintrin.h>
+#define SLOGIC_UNPACK_SSE2 1
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define SLOGIC_UNPACK_NEON 1
+#endif
+
 #include "slogic.h"
 
 /* ---------------------------------------------------------------------- */
@@ -145,6 +156,104 @@ uint64_t slogic_samples_in_bytes(int nch, uint64_t bytes)
 	return bytes * 8 / (uint64_t)nch;
 }
 
+/*
+ * Whole packed bytes -> one byte per sample. 16 input bytes at a time with
+ * SSE2/NEON for 2 and 4 channels (4 ch: ~35 GS/s in cache vs ~2.8 GS/s for
+ * the old byte loop on a 2.1 GHz Xeon), then counted scalar loops with a
+ * constant shift per mode for the tail, 1 ch, and other CPUs.
+ */
+static void unpack_whole_bytes(int nch, const uint8_t *restrict p, size_t nb,
+			       uint8_t *restrict out)
+{
+	size_t j = 0;
+	unsigned k;
+
+	switch (nch) {
+	case 4:
+#if defined(SLOGIC_UNPACK_SSE2)
+		{
+			const __m128i m = _mm_set1_epi8(0x0f);
+			for (; j + 16 <= nb; j += 16) {
+				__m128i x = _mm_loadu_si128((const __m128i *)(p + j));
+				__m128i lo = _mm_and_si128(x, m);
+				__m128i hi = _mm_and_si128(_mm_srli_epi16(x, 4), m);
+				_mm_storeu_si128((__m128i *)(out + 2 * j),
+						 _mm_unpacklo_epi8(lo, hi));
+				_mm_storeu_si128((__m128i *)(out + 2 * j + 16),
+						 _mm_unpackhi_epi8(lo, hi));
+			}
+		}
+#elif defined(SLOGIC_UNPACK_NEON)
+		for (; j + 16 <= nb; j += 16) {
+			uint8x16_t x = vld1q_u8(p + j);
+			uint8x16x2_t v;
+			v.val[0] = vandq_u8(x, vdupq_n_u8(0x0f));
+			v.val[1] = vshrq_n_u8(x, 4);
+			vst2q_u8(out + 2 * j, v); /* interleaving store */
+		}
+#endif
+		for (; j < nb; j++) {
+			uint8_t b = p[j];
+			out[2 * j] = b & 0x0f;
+			out[2 * j + 1] = b >> 4;
+		}
+		break;
+	case 2:
+#if defined(SLOGIC_UNPACK_SSE2)
+		{
+			/* Split into nibbles in sample order, then each nibble
+			 * into its two 2-bit samples. */
+			const __m128i mf = _mm_set1_epi8(0x0f), m3 = _mm_set1_epi8(3);
+			for (; j + 16 <= nb; j += 16) {
+				__m128i x = _mm_loadu_si128((const __m128i *)(p + j));
+				__m128i n0 = _mm_and_si128(x, mf);
+				__m128i n1 = _mm_and_si128(_mm_srli_epi16(x, 4), mf);
+				__m128i a = _mm_unpacklo_epi8(n0, n1);
+				__m128i b = _mm_unpackhi_epi8(n0, n1);
+				__m128i a0 = _mm_and_si128(a, m3);
+				__m128i a1 = _mm_and_si128(_mm_srli_epi16(a, 2), m3);
+				__m128i b0 = _mm_and_si128(b, m3);
+				__m128i b1 = _mm_and_si128(_mm_srli_epi16(b, 2), m3);
+				_mm_storeu_si128((__m128i *)(out + 4 * j),
+						 _mm_unpacklo_epi8(a0, a1));
+				_mm_storeu_si128((__m128i *)(out + 4 * j + 16),
+						 _mm_unpackhi_epi8(a0, a1));
+				_mm_storeu_si128((__m128i *)(out + 4 * j + 32),
+						 _mm_unpacklo_epi8(b0, b1));
+				_mm_storeu_si128((__m128i *)(out + 4 * j + 48),
+						 _mm_unpackhi_epi8(b0, b1));
+			}
+		}
+#elif defined(SLOGIC_UNPACK_NEON)
+		{
+			const uint8x16_t m3 = vdupq_n_u8(3);
+			for (; j + 16 <= nb; j += 16) {
+				uint8x16_t x = vld1q_u8(p + j);
+				uint8x16x4_t v;
+				v.val[0] = vandq_u8(x, m3);
+				v.val[1] = vandq_u8(vshrq_n_u8(x, 2), m3);
+				v.val[2] = vandq_u8(vshrq_n_u8(x, 4), m3);
+				v.val[3] = vshrq_n_u8(x, 6);
+				vst4q_u8(out + 4 * j, v); /* interleaving store */
+			}
+		}
+#endif
+		for (; j < nb; j++) {
+			uint8_t b = p[j];
+			for (k = 0; k < 4; k++)
+				out[4 * j + k] = (b >> (2 * k)) & 3;
+		}
+		break;
+	case 1: /* no model has a 1-channel mode; kept portable */
+		for (; j < nb; j++) {
+			uint8_t b = p[j];
+			for (k = 0; k < 8; k++)
+				out[8 * j + k] = (b >> k) & 1;
+		}
+		break;
+	}
+}
+
 size_t slogic_unpack_range(int nch, const uint8_t *packed, uint64_t first,
 			   size_t nsamples, uint8_t *out)
 {
@@ -169,20 +278,12 @@ size_t slogic_unpack_range(int nch, const uint8_t *packed, uint64_t first,
 	}
 	/* Whole bytes. */
 	p = packed + first / spb;
-	if (nch == 4) {
-		while (nsamples - i >= 2) {
-			uint8_t b = *p++;
-			out[i] = b & 0x0f;
-			out[i + 1] = b >> 4;
-			i += 2;
-		}
-	} else {
-		while (nsamples - i >= spb) {
-			uint8_t b = *p++;
-			for (k = 0; k < spb; k++)
-				out[i + k] = (b >> (k * nch)) & mask;
-			i += spb;
-		}
+	{
+		size_t nb = (nsamples - i) / spb;
+
+		unpack_whole_bytes(nch, p, nb, out + i);
+		i += nb * spb;
+		p += nb;
 	}
 	/* Trailing partial byte: only the samples asked for are read. */
 	for (k = 0; i < nsamples; k++)
@@ -256,6 +357,25 @@ void slogic_trigger_reset(slogic_trigger *t)
 	t->have_prev = 0;
 }
 
+/* The whole-word paths load samples with memcpy into a u64. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "slogic_trigger_scan assumes a little-endian host"
+#endif
+
+static inline unsigned ctz64(uint64_t v) /* v != 0 */
+{
+#if defined(__GNUC__) || defined(__clang__)
+	return (unsigned)__builtin_ctzll(v);
+#else
+	unsigned n = 0;
+	while (!(v & 1)) {
+		v >>= 1;
+		n++;
+	}
+	return n;
+#endif
+}
+
 static inline int trig_match(const slogic_trigger *t, uint32_t p, uint32_t s)
 {
 	return ((s ^ t->lvl_val) & t->lvl_mask) == 0 &&
@@ -311,20 +431,58 @@ int64_t slogic_trigger_scan(slogic_trigger *t, const uint8_t *packed, size_t len
 		t->prev = s;
 	}
 	/* Whole words: skip any word where the relevant bits never change. */
-	for (; i + spw <= n; i += spw) {
-		uint64_t x, y;
-		unsigned k;
-		memcpy(&x, packed + i * w / 8, 8); /* little-endian hosts */
-		y = (x << w) | t->prev;
-		if (((x ^ y) & t->edge_bcast) == 0) {
+	if (w < 32) {
+		/*
+		 * A word that does change is matched in all its lanes at once:
+		 * `bad` has a bit set wherever a lane fails a condition, each
+		 * lane is ORed down into its lowest bit, and the first lane left
+		 * at zero is the first match. 2-5x faster than testing samples
+		 * one by one when a watched channel toggles all the time (a
+		 * clock under an edge-AND-level trigger).
+		 */
+		const uint64_t lm = bcast(t->lvl_mask, w), lv = bcast(t->lvl_val, w);
+		const uint64_t rise = bcast(t->rise, w), fall = bcast(t->fall, w);
+		const uint64_t any = bcast(t->any, w), lsb = bcast(1, w);
+
+		for (; i + spw <= n; i += spw) {
+			uint64_t x, y, bad, hit;
+			unsigned s;
+			memcpy(&x, packed + i * w / 8, 8);
+			y = (x << w) | t->prev;
+			if (((x ^ y) & t->edge_bcast) != 0) {
+				bad = ((x ^ lv) & lm) | (rise & ~(~y & x)) |
+				      (fall & ~(y & ~x)) | (any & ~(x ^ y));
+				for (s = 1; s < w; s <<= 1)
+					bad |= bad >> s;
+				hit = ~bad & lsb;
+				if (hit) {
+					unsigned k = ctz64(hit) / w;
+					/* Leave prev at the sample before the
+					 * hit, as the per-sample path does. */
+					if (k)
+						t->prev = (uint32_t)((x >> ((k - 1) * w)) & lane);
+					return (int64_t)(i + k);
+				}
+			}
 			t->prev = (uint32_t)((x >> (64 - w)) & lane);
-			continue;
 		}
-		for (k = 0; k < spw; k++) {
-			uint32_t s = (uint32_t)((x >> (k * w)) & lane);
-			if (trig_match(t, t->prev, s))
-				return (int64_t)(i + k);
-			t->prev = s;
+	} else {
+		/* 32 ch: two lanes per word, the per-sample test is faster. */
+		for (; i + spw <= n; i += spw) {
+			uint64_t x, y;
+			unsigned k;
+			memcpy(&x, packed + i * w / 8, 8);
+			y = (x << w) | t->prev;
+			if (((x ^ y) & t->edge_bcast) == 0) {
+				t->prev = (uint32_t)((x >> (64 - w)) & lane);
+				continue;
+			}
+			for (k = 0; k < spw; k++) {
+				uint32_t s = (uint32_t)((x >> (k * w)) & lane);
+				if (trig_match(t, t->prev, s))
+					return (int64_t)(i + k);
+				t->prev = s;
+			}
 		}
 	}
 	/* Tail. */
@@ -503,8 +661,12 @@ static int acc_process(slogic_acc *a, const uint8_t *p, size_t len)
 				return SLOGIC_ACC_MORE;
 			a->armed = 1;
 			/* The scan starts after the window: seed it with the
-			 * window's last sample so an edge right there counts. */
-			if (from) {
+			 * window's last sample so an edge right there counts.
+			 * Only for edge triggers: the seed is never tested
+			 * itself, and a pure level trigger already true here
+			 * would then sit in words the scan skips as unchanged
+			 * and never fire. Unseeded, its first sample is tested. */
+			if (from && a->trig.edge_all) {
 				a->trig.prev = get_sample(&a->trig, p, from - 1);
 				a->trig.have_prev = 1;
 			}

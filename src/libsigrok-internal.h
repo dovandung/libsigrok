@@ -1848,6 +1848,12 @@ struct sr_session {
 	unsigned int stop_check_id;
 	/** Whether the session has been started. */
 	gboolean running;
+	/**
+	 * Number of packets sent through sr_session_send(). The USB event
+	 * source uses it as its activity indicator when libusb cannot export
+	 * its event handles (stock libusb on Windows), see usb.c.
+	 */
+	uint64_t packets_sent;
 };
 
 SR_PRIV int sr_session_source_add_internal(struct sr_session *session,
@@ -1958,6 +1964,7 @@ SR_PRIV GVariant *std_gvar_array_str(const char *a[], unsigned int n);
 SR_PRIV GVariant *std_gvar_thresholds(const double a[][2], unsigned int n);
 
 SR_PRIV int std_str_idx(GVariant *data, const char *a[], unsigned int n);
+SR_PRIV int std_i32_idx(GVariant *data, const int32_t a[], unsigned int n);
 SR_PRIV int std_u64_idx(GVariant *data, const uint64_t a[], unsigned int n);
 SR_PRIV int std_u8_idx(GVariant *data, const uint8_t a[], unsigned int n);
 
@@ -2032,6 +2039,12 @@ SR_PRIV struct soft_trigger_logic *soft_trigger_logic_new(
 SR_PRIV void soft_trigger_logic_free(struct soft_trigger_logic *st);
 SR_PRIV int soft_trigger_logic_check(struct soft_trigger_logic *st, uint8_t *buf,
 		int len, int *pre_trigger_samples);
+/* 1-byte samples, without the generic unitsize handling. */
+SR_PRIV int soft_trigger_logic_check8bit(struct soft_trigger_logic *st,
+		uint8_t *buf, int len, int *pre_trigger_samples);
+/* Byte-packed 1/2/4/8+ channel data; returns a byte offset, no pre-trigger. */
+SR_PRIV int soft_trigger_logic_check_sipeed(struct soft_trigger_logic *st,
+		uint8_t *buf, int length, int *pre_trigger_samples, int nChannel);
 
 /*--- serial.c --------------------------------------------------------------*/
 
