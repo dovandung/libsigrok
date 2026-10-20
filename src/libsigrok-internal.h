@@ -2039,6 +2039,12 @@ SR_PRIV struct soft_trigger_logic *soft_trigger_logic_new(
 SR_PRIV void soft_trigger_logic_free(struct soft_trigger_logic *st);
 SR_PRIV int soft_trigger_logic_check(struct soft_trigger_logic *st, uint8_t *buf,
 		int len, int *pre_trigger_samples);
+/* 1-byte samples, without the generic unitsize handling. */
+SR_PRIV int soft_trigger_logic_check8bit(struct soft_trigger_logic *st,
+		uint8_t *buf, int len, int *pre_trigger_samples);
+/* Byte-packed 1/2/4/8+ channel data; returns a byte offset, no pre-trigger. */
+SR_PRIV int soft_trigger_logic_check_sipeed(struct soft_trigger_logic *st,
+		uint8_t *buf, int length, int *pre_trigger_samples, int nChannel);
 
 /*--- serial.c --------------------------------------------------------------*/
 
