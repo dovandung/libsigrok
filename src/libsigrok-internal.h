@@ -1848,6 +1848,12 @@ struct sr_session {
 	unsigned int stop_check_id;
 	/** Whether the session has been started. */
 	gboolean running;
+	/**
+	 * Number of packets sent through sr_session_send(). The USB event
+	 * source uses it as its activity indicator when libusb cannot export
+	 * its event handles (stock libusb on Windows), see usb.c.
+	 */
+	uint64_t packets_sent;
 };
 
 SR_PRIV int sr_session_source_add_internal(struct sr_session *session,

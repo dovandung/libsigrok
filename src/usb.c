@@ -37,6 +37,36 @@
 typedef int libusb_os_handle;
 #endif
 
+/*
+ * Stock libusb cannot hand out its event handles on Windows
+ * (libusb_get_pollfds() returns NULL there; only the old
+ * "event-abstraction" libusb fork can). The USB event source then services
+ * libusb from the session main loop itself, in one of two ways:
+ *
+ *  - wait (default): every main loop iteration waits in libusb for up to
+ *    SIGROK_USB_WAIT_MS (default USB_WAIT_MS) and handles a completion as
+ *    soon as it arrives, like a poll handle would. The source runs at low
+ *    priority, so the session's other sources (stop, timers) go first.
+ *  - timer (SIGROK_USB_WAIT_MS=0): a USB_POLL_MS timer.
+ *
+ * Either way every completed transfer is handled on the session thread,
+ * as with poll handles, so drivers do not notice.
+ */
+#define USB_WAIT_MS 10
+#define USB_POLL_MS 5
+
+static int usb_wait_ms(void)
+{
+	const char *env;
+	int ms;
+
+	env = g_getenv("SIGROK_USB_WAIT_MS");
+	if (!env || !*env)
+		return USB_WAIT_MS;
+	ms = atoi(env);
+	return CLAMP(ms, 0, 100);
+}
+
 /** Custom GLib event source for libusb I/O.
  */
 struct usb_source {
@@ -50,7 +80,56 @@ struct usb_source {
 
 	struct libusb_context *usb_ctx;
 	GPtrArray *pollfds;
+
+	/* Polled mode (no poll handles from libusb), see USB_WAIT_MS. */
+	gboolean polled;
+	int wait_ms;              /* > 0: wait mode, 0: timer mode */
+	int64_t next_poll_us;
+	uint64_t packets_seen;
 };
+
+/** Handle pending libusb events without blocking.
+ *
+ * The source does this itself, before calling the driver, so that drivers
+ * work either way: upstream drivers handle libusb events in their callback
+ * as well (a second, empty call is harmless), while drivers written for
+ * the "idle USB" libsigrok variant no longer do, or register no callback
+ * at all and rely on the source alone.
+ */
+static void usb_source_handle_events(struct usb_source *usource)
+{
+	struct timeval tv = { 0, 0 };
+	int ret;
+
+	ret = libusb_handle_events_timeout_completed(usource->usb_ctx, &tv, NULL);
+	if (G_UNLIKELY(ret < 0))
+		sr_dbg("Failed to handle libusb events: %s",
+			libusb_error_name(ret));
+}
+
+/** USB event source prepare() method, polled mode.
+ */
+static gboolean usb_source_prepare_polled(struct usb_source *usource,
+		int *timeout)
+{
+	int64_t now_us, wake_us;
+
+	now_us = g_source_get_time(&usource->base);
+	if (usource->due_us == 0)
+		usource->due_us = now_us + usource->timeout_us;
+	if (usource->wait_ms > 0) {
+		/* Always ready: the wait happens inside libusb, in dispatch. */
+		*timeout = 0;
+		return TRUE;
+	}
+	if (usource->next_poll_us == 0)
+		usource->next_poll_us = now_us + USB_POLL_MS * 1000;
+
+	wake_us = MIN(usource->next_poll_us, usource->due_us);
+	*timeout = (int)((MAX(0, wake_us - now_us) + 999) / 1000);
+
+	return (*timeout == 0);
+}
 
 /** USB event source prepare() method.
  */
@@ -63,6 +142,9 @@ static gboolean usb_source_prepare(GSource *source, int *timeout)
 	int ret;
 
 	usource = (struct usb_source *)source;
+
+	if (usource->polled)
+		return usb_source_prepare_polled(usource, timeout);
 
 	ret = libusb_get_next_timeout(usource->usb_ctx, &usb_timeout);
 	if (G_UNLIKELY(ret < 0)) {
@@ -103,12 +185,73 @@ static gboolean usb_source_check(GSource *source)
 	usource = (struct usb_source *)source;
 	revents = 0;
 
+	if (usource->polled) {
+		int64_t now_us = g_source_get_time(source);
+		return (usource->wait_ms > 0 ||
+			usource->next_poll_us <= now_us ||
+			usource->due_us <= now_us);
+	}
+
 	for (i = 0; i < usource->pollfds->len; i++) {
 		pollfd = g_ptr_array_index(usource->pollfds, i);
 		revents |= pollfd->revents;
 	}
 	return (revents != 0 || (usource->due_us != INT64_MAX
 			&& usource->due_us <= g_source_get_time(source)));
+}
+
+/** USB event source dispatch() method, polled mode.
+ *
+ * Calls the driver on every poll tick with revents = G_IO_IN, so that it
+ * handles libusb events as it would on a poll handle. Without poll handles
+ * there is no way to tell whether a tick saw USB I/O, so the session's
+ * packet count stands in for it: the driver timeout (revents = 0) is
+ * reported only once timeout_ms has passed without the session receiving
+ * a packet, which is what drivers use it for (stop on silence, status
+ * polling while idle).
+ */
+static gboolean usb_source_dispatch_polled(struct usb_source *usource,
+		GSourceFunc callback, void *user_data)
+{
+	GSource *source;
+	int64_t now_us;
+	uint64_t packets;
+	unsigned int revents;
+	gboolean keep;
+
+	source = &usource->base;
+
+	if (usource->wait_ms > 0) {
+		/* Wait for USB I/O; returns as soon as a completion is handled. */
+		struct timeval tv = { 0, usource->wait_ms * 1000 };
+		libusb_handle_events_timeout_completed(usource->usb_ctx, &tv, NULL);
+	} else {
+		usb_source_handle_events(usource);
+	}
+	now_us = g_get_monotonic_time();
+
+	if (!callback) {
+		/* No driver callback: handling libusb events is all there is. */
+		usource->next_poll_us = now_us + USB_POLL_MS * 1000;
+		return G_SOURCE_CONTINUE;
+	}
+
+	packets = usource->session ? usource->session->packets_sent : 0;
+	if (packets != usource->packets_seen) {
+		usource->packets_seen = packets;
+		if (usource->timeout_us >= 0)
+			usource->due_us = now_us + usource->timeout_us;
+	}
+	revents = (usource->due_us <= now_us) ? 0 : G_IO_IN;
+
+	keep = (*SR_RECEIVE_DATA_CALLBACK(callback))(-1, revents, user_data);
+
+	if (G_LIKELY(keep) && G_LIKELY(!g_source_is_destroyed(source))) {
+		usource->next_poll_us = now_us + USB_POLL_MS * 1000;
+		if (revents == 0)
+			usource->due_us = now_us + usource->timeout_us;
+	}
+	return keep;
 }
 
 /** USB event source dispatch() method.
@@ -134,11 +277,15 @@ static gboolean usb_source_dispatch(GSource *source,
 		revents |= pollfd->revents;
 	}
 
-	if (!callback) {
-		sr_err("Callback not set, cannot dispatch event.");
-		return G_SOURCE_REMOVE;
-	}
-	keep = (*SR_RECEIVE_DATA_CALLBACK(callback))(-1, revents, user_data);
+	if (usource->polled)
+		return usb_source_dispatch_polled(usource, callback, user_data);
+
+	usb_source_handle_events(usource);
+
+	/* No driver callback ("idle USB" drivers): keep handling events
+	 * until the driver removes the source with usb_source_remove(). */
+	keep = callback ? (*SR_RECEIVE_DATA_CALLBACK(callback))(-1, revents,
+			user_data) : G_SOURCE_CONTINUE;
 
 	if (G_LIKELY(keep) && G_LIKELY(!g_source_is_destroyed(source))) {
 		if (usource->timeout_us >= 0)
@@ -262,10 +409,6 @@ static GSource *usb_source_new(struct sr_session *session,
 	const struct libusb_pollfd **upollfds, **upfd;
 
 	upollfds = libusb_get_pollfds(usb_ctx);
-	if (!upollfds) {
-		sr_err("Failed to get libusb file descriptors.");
-		return NULL;
-	}
 	source = g_source_new(&usb_source_funcs, sizeof(struct usb_source));
 	usource = (struct usb_source *)source;
 
@@ -281,6 +424,23 @@ static GSource *usb_source_new(struct sr_session *session,
 	usource->session = session;
 	usource->usb_ctx = usb_ctx;
 	usource->pollfds = g_ptr_array_new_full(8, &usb_source_free_pollfd);
+
+	if (!upollfds) {
+		/* Stock libusb on Windows: no poll handles, see USB_WAIT_MS. */
+		usource->polled = TRUE;
+		usource->wait_ms = usb_wait_ms();
+		usource->packets_seen = session ? session->packets_sent : 0;
+		if (usource->wait_ms > 0) {
+			g_source_set_priority(source, G_PRIORITY_LOW);
+			sr_dbg("libusb provides no poll handles, waiting for "
+				"USB events up to %d ms per main loop pass.",
+				usource->wait_ms);
+		} else {
+			sr_dbg("libusb provides no poll handles, polling USB "
+				"every %d ms.", USB_POLL_MS);
+		}
+		return source;
+	}
 
 	for (upfd = upollfds; *upfd != NULL; upfd++)
 		usb_pollfd_added((*upfd)->fd, (*upfd)->events, usource);
@@ -498,6 +658,14 @@ SR_PRIV int usb_source_add(struct sr_session *session, struct sr_context *ctx,
 {
 	GSource *source;
 	int ret;
+
+	/*
+	 * Without a callback the source only handles libusb events, so the
+	 * driver timeout means nothing ("idle USB" drivers pass 0 here, which
+	 * would otherwise make the source fire continuously).
+	 */
+	if (!cb)
+		timeout = -1;
 
 	source = usb_source_new(session, ctx->libusb_ctx, timeout);
 	if (!source)

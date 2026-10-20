@@ -1145,6 +1145,9 @@ SR_PRIV int sr_session_send(const struct sr_dev_inst *sdi,
 		return SR_ERR_BUG;
 	}
 
+	/* Activity indicator for the polled USB event source (usb.c). */
+	sdi->session->packets_sent++;
+
 	/*
 	 * Pass the packet to the first transform module. If that returns
 	 * another packet (instead of NULL), pass that packet to the next
