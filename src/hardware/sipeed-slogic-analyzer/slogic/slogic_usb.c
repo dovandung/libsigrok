@@ -72,6 +72,19 @@
 #define DESTROY_WAIT_US   (2 * 1000 * 1000)
 #define FREELIST_MAX      (SLOGIC_MAX_TRANSFERS + 8)
 
+/*
+ * Windows with libusb older than 1.0.30: the WinUSB RAW_IO maximum cannot be
+ * queried, yet a patched libusb (sigrok's MXE libusb1_upgrade.patch) still
+ * switches RAW_IO on for every read that is a multiple of 512 bytes, and
+ * WinUSB fails RAW_IO reads above that maximum (~2 MB seen in practice) -- no
+ * capture larger than one transfer then gets any data. Probe at most this
+ * much, so transfers stay at a quarter of it (1 MiB).
+ */
+#if defined(_WIN32) && \
+	!(defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x0100010C))
+#define LEGACY_WIN_PROBE_MAX (4u * 1024u * 1024u)
+#endif
+
 /* ---------------------------------------------------------------------- */
 /* small platform helpers                                                  */
 /* ---------------------------------------------------------------------- */
@@ -135,6 +148,9 @@ struct slogic_dev {
 	slogic_capture *live;
 };
 
+/* vsnprintf here is the C runtime's own: on MinGW without
+ * __USE_MINGW_ANSI_STDIO (libsigrok's default) that is msvcrt.dll, which
+ * does not know %zu. Print sizes as %llu with an (unsigned long long) cast. */
 static void dlog(const slogic_dev *d, int level, const char *fmt, ...)
 {
 	char buf[512];
@@ -637,8 +653,8 @@ static void LIBUSB_CALL xfer_cb(struct libusb_transfer *x)
 		default:
 			break;
 		}
-		dlog(d, SLOGIC_LOG_SPEW, "slogic-xfer t_ms=%.3f len=%zu cum=%llu st=%d",
-		     (double)(now - c->t_run) / 1000.0, len,
+		dlog(d, SLOGIC_LOG_SPEW, "slogic-xfer t_ms=%.3f len=%llu cum=%llu st=%d",
+		     (double)(now - c->t_run) / 1000.0, (unsigned long long)len,
 		     (unsigned long long)c->raw_bytes, (int)x->status);
 		/* Live rate at debug level, at most every 200 ms: the same fit the
 		 * final slogic-report line uses, so the figures agree. */
@@ -723,6 +739,10 @@ static uint32_t probe_size(slogic_capture *c)
 	sz = (PROBE_MS * bpms + ALIGN - 1) / ALIGN * ALIGN;
 	if (d->raw_io_max > 0 && sz > (uint64_t)d->raw_io_max)
 		sz = (uint64_t)d->raw_io_max & ~(uint64_t)(ALIGN - 1);
+#ifdef LEGACY_WIN_PROBE_MAX
+	if (sz > LEGACY_WIN_PROBE_MAX)
+		sz = LEGACY_WIN_PROBE_MAX;
+#endif
 	if (sz > (uint64_t)XFER_MAX * 4)
 		sz = (uint64_t)XFER_MAX * 4;
 	while (sz > XFER_MIN) {
