@@ -2221,6 +2221,13 @@ SR_PRIV int ezusb_install_firmware(struct sr_context *ctx, libusb_device_handle 
 				   const char *name);
 SR_PRIV int ezusb_upload_firmware(struct sr_context *ctx, libusb_device *dev,
 				  int configuration, const char *name);
+/* Cypress FX3 (cypress-fx3-16, cypress-fx3-8): .img firmware into RAM. */
+SR_PRIV int ezusb_fx3_ram_write(libusb_device_handle *hdl, unsigned char *buf,
+				unsigned int ramAddress, int len);
+SR_PRIV int ezusb_install_firmware_fx3(struct sr_context *ctx,
+				       libusb_device_handle *hdl, const char *name);
+SR_PRIV int ezusb_upload_firmware_fx3(struct sr_context *ctx, libusb_device *dev,
+				      int configuration, const char *name);
 #endif
 
 /*--- usb.c -----------------------------------------------------------------*/
