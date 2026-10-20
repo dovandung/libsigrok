@@ -437,7 +437,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 
 	if (transfer->actual_length == 0 || packet_has_error) {
 		devc->empty_transfer_count++;
-		if (devc->empty_transfer_count > 1 ) { //MAX_EMPTY_TRANSFERS) {
+		if (devc->empty_transfer_count > MAX_EMPTY_TRANSFERS) {
 			/*
 			 * The FX2 gave up. End the acquisition, the frontend
 			 * will work out that the samplecount is short.
