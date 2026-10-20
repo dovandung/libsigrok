@@ -620,8 +620,8 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 	struct sr_usb_dev_inst *usb;
 	struct sr_trigger *trigger;
 	struct libusb_transfer *transfer;
-	unsigned int i, num_transfers;
-	int timeout, ret, error_libusb;
+	unsigned int i, j, num_transfers;
+	int timeout, ret;
 	unsigned char *buf[NUM_SIMUL_TRANSFERS];
 	size_t size;
    
@@ -662,10 +662,11 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 	for (i = 0; i < num_transfers; i++) {
 		if (!(buf[i] = g_try_malloc(size))) {
 			sr_err("USB transfer buffer malloc failed.");
+			while (i > 0)
+				g_free(buf[--i]);
 			return SR_ERR_MALLOC;
 		}
 	}
-	error_libusb = 0 ;
 	for (i = 0; i < num_transfers; i++) {
 		/*
 		if (!(buf = g_try_malloc(size))) {
@@ -674,30 +675,34 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 		}
 		*/
 		transfer = libusb_alloc_transfer(0);
-		libusb_fill_bulk_transfer(transfer, usb->devhdl,
-				2 | LIBUSB_ENDPOINT_IN, buf[i], size,
-				receive_transfer, (void *)sdi, timeout);
-		sr_info("submitting transfer: %d", i);
-		if ((ret = libusb_submit_transfer(transfer)) != 0) {
-			sr_err("Failed to submit transfer: %s.",
-			       libusb_error_name(ret));
-			libusb_free_transfer(transfer);
+		if (!transfer) {
+			sr_err("USB transfer malloc failed.");
+			ret = LIBUSB_ERROR_NO_MEM;
+		} else {
+			libusb_fill_bulk_transfer(transfer, usb->devhdl,
+					2 | LIBUSB_ENDPOINT_IN, buf[i], size,
+					receive_transfer, (void *)sdi, timeout);
+			sr_info("submitting transfer: %d", i);
+			ret = libusb_submit_transfer(transfer);
+			if (ret != 0) {
+				sr_err("Failed to submit transfer: %s.",
+				       libusb_error_name(ret));
+				libusb_free_transfer(transfer);
+			}
+		}
+		if (ret != 0) {
 			/*
-			g_free(buf);
+			 * As upstream fx2lafw: free the buffers no submitted
+			 * transfer owns, and cancel the submitted ones (each
+			 * frees its own buffer in free_transfer()).
+			 */
+			for (j = i; j < num_transfers; j++)
+				g_free(buf[j]);
 			cypress_fx3_abort_acquisition(devc);
-			return SR_ERR; */
-			error_libusb = 1 ;
+			return SR_ERR;
 		}
 		devc->transfers[i] = transfer;
 		devc->submitted_transfers++;
-	}
-	if (error_libusb==1)
-	{
-			for (i = 0; i < num_transfers; i++) 
-				g_free(buf[i]);
-			
-			cypress_fx3_abort_acquisition(devc);
-			return SR_ERR;
 	}
 	/*
 	 * If this device has analog channels and at least one of them is
@@ -752,7 +757,8 @@ total_receive = 0 ;
 		devc->analog_buffer = g_try_malloc(
 			sizeof(float) * size / 2);
 	}
-	start_transfers(sdi);
+	if ((ret = start_transfers(sdi)) != SR_OK)
+		return ret;
 	//Sleep(500) ;
 	if ((ret = command_start_acquisition(sdi)) != SR_OK) {
 		cypress_fx3_abort_acquisition(devc);
