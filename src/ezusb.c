@@ -146,92 +146,135 @@ SR_PRIV int ezusb_upload_firmware(struct sr_context *ctx, libusb_device *dev,
 	return SR_OK;
 }
 
-SR_PRIV int ezusb_fx3_ram_write (libusb_device_handle *hdl,
-        unsigned char *buf,
-        unsigned int   ramAddress,
-        int            len)
+SR_PRIV int ezusb_fx3_ram_write(libusb_device_handle *hdl,
+		unsigned char *buf, unsigned int ramAddress, int len)
 {
-    int r;
-    int index = 0;
-    int size;
+	int r, size, index;
 
-    while (len > 0) {
-        size = MIN(len ,FW_CHUNKSIZE);
+	index = 0;
+	while (len > 0) {
+		size = MIN(len, FW_CHUNKSIZE);
 
-        r = libusb_control_transfer (hdl, 0x40, 0xA0, GET_LSW(ramAddress), GET_MSW(ramAddress),
-                &buf[index], size, 100);
+		r = libusb_control_transfer(hdl, LIBUSB_REQUEST_TYPE_VENDOR |
+				LIBUSB_ENDPOINT_OUT, 0xa0,
+				GET_LSW(ramAddress), GET_MSW(ramAddress),
+				&buf[index], size, 100);
+		if (r != size) {
+			sr_err("Vendor write to FX3 RAM at 0x%08x failed: %s.",
+				ramAddress, r < 0 ? libusb_error_name(r) :
+				"short write");
+			return SR_ERR;
+		}
+		ramAddress += size;
+		index += size;
+		len -= size;
+	}
 
-        if (r != size) {
-            sr_err ("Error: Vendor write to FX3 RAM failed\n");
-            return SR_ERR;
-        }
-        ramAddress += size;
-        index      += size;
-        len        -= size;
-    }
-
-    return SR_OK;
+	return SR_OK;
 }
 
+/*
+ * Download an FX3 boot image (.img, as produced by elf2img) to the FX3
+ * bootloader's RAM and start it.
+ *
+ * Image layout, all words little-endian:
+ *   'C' 'Y' bImageCTL bImageType(0xB0 = normal firmware)
+ *   { dLength (in 32-bit words), dAddress, dLength words of data } ...
+ *   dLength = 0, dAddress = program entry, checksum (sum of data words)
+ */
 SR_PRIV int ezusb_install_firmware_fx3(struct sr_context *ctx,
-				   libusb_device_handle *hdl,
-				   const char *name)
+		libusb_device_handle *hdl, const char *name)
 {
 	unsigned char *firmware;
-	size_t length, offset, chunksize,filesize;
-	int ret, result;
-	unsigned int  *data_p;
-    unsigned int i, checksum;
-    unsigned int address;
-    int r, index;
+	size_t filesize, index, length, i;
+	uint32_t address, checksum;
+	int r, result;
+	gboolean reported;
 
-	/* Max size of FX3 fw file is 256 KB  = 1 << 18*/
+	/* Max size of an FX3 firmware image is 256 kiB (1 << 18). */
 	firmware = sr_resource_load(ctx, SR_RESOURCE_FIRMWARE,
 			name, &filesize, 1 << 18);
 	if (!firmware)
 		return SR_ERR;
 
+	if (filesize < 4 || firmware[0] != 'C' || firmware[1] != 'Y' ||
+			firmware[3] != 0xb0) {
+		sr_err("'%s' is not an FX3 firmware image.", name);
+		g_free(firmware);
+		return SR_ERR;
+	}
+
 	sr_info("Uploading FX3 firmware '%s'.", name);
 
-	result = SR_OK;
-	/* Run through each section of code, and use vendor commands to download them to RAM.*/
-    index    = 4;
-    checksum = 0;
-    while (index < filesize) {
-        data_p  = (unsigned int *)(firmware + index);
-        length  = data_p[0];
-        address = data_p[1];
-        if (length != 0) {
-            for (i = 0; i < length; i++)
-                checksum += data_p[2 + i];
-            r = ezusb_fx3_ram_write (hdl, firmware + index + 8, address, length * 4);
-            if (r != 0) {
-                sr_err ("Error: Failed to download data to FX3 RAM\n");
-                free (firmware);
-                return SR_ERR;
-            }
-        } else {
-            if (checksum != data_p[2]) {
-                sr_err ("Error: Checksum error in firmware binary\n");
-                free (firmware);
-                return SR_ERR;
-            }
-            r = libusb_control_transfer (hdl, 0x40, 0xA0, GET_LSW(address), GET_MSW(address), NULL,
-                    0, 100);
-            if (r != 0)
-                printf ("Info: Ignored error in control transfer: %d\n", r);
-            break;
-        }
-        index += (8 + length * 4);
-    }
+	/*
+	 * Run through each section of code, and use vendor commands to
+	 * download them to RAM. Every read is bounds checked against the
+	 * file size, and words are read with RL32() (the image buffer has
+	 * no alignment guarantee and the host may not be little-endian).
+	 */
+	result = SR_ERR;
+	reported = FALSE;
+	index = 4;
+	checksum = 0;
+	while (filesize - index >= 8) {
+		length = RL32(firmware + index);
+		address = RL32(firmware + index + 4);
+		index += 8;
+
+		if (length == 0) {
+			/* Final section: checksum, then jump to entry point. */
+			if (filesize - index < 4) {
+				sr_err("FX3 firmware image is truncated.");
+				reported = TRUE;
+				break;
+			}
+			if (checksum != RL32(firmware + index)) {
+				sr_err("Checksum error in FX3 firmware image.");
+				reported = TRUE;
+				break;
+			}
+			/*
+			 * The device leaves the bootloader as soon as it
+			 * gets this, so the transfer often reports an error.
+			 */
+			r = libusb_control_transfer(hdl,
+					LIBUSB_REQUEST_TYPE_VENDOR |
+					LIBUSB_ENDPOINT_OUT, 0xa0,
+					GET_LSW(address), GET_MSW(address),
+					NULL, 0, 100);
+			if (r != 0)
+				sr_dbg("Ignored error in FX3 start command: %s.",
+					libusb_error_name(r));
+			result = SR_OK;
+			break;
+		}
+
+		if (length > (filesize - index) / 4) {
+			sr_err("FX3 firmware image is truncated.");
+			reported = TRUE;
+			break;
+		}
+		for (i = 0; i < length; i++)
+			checksum += RL32(firmware + index + 4 * i);
+		if (ezusb_fx3_ram_write(hdl, firmware + index, address,
+				(int)(length * 4)) != SR_OK) {
+			sr_err("Failed to download data to FX3 RAM.");
+			reported = TRUE;
+			break;
+		}
+		index += length * 4;
+	}
+	if (result != SR_OK && !reported)
+		sr_err("FX3 firmware image has no entry-point section.");
 	g_free(firmware);
 
-	sr_info("Firmware upload done.");
+	if (result == SR_OK)
+		sr_info("FX3 firmware upload done.");
 	return result;
 }
 
-SR_PRIV int ezusb_upload_firmware_fx3(struct sr_context *ctx, libusb_device *dev,
-				  int configuration, const char *name)
+SR_PRIV int ezusb_upload_firmware_fx3(struct sr_context *ctx,
+		libusb_device *dev, int configuration, const char *name)
 {
 	struct libusb_device_handle *hdl;
 	int ret;
@@ -253,6 +296,7 @@ SR_PRIV int ezusb_upload_firmware_fx3(struct sr_context *ctx, libusb_device *dev
 		if ((ret = libusb_detach_kernel_driver(hdl, 0)) < 0) {
 			sr_err("failed to detach kernel driver: %s",
 					libusb_error_name(ret));
+			libusb_close(hdl);
 			return SR_ERR;
 		}
 	}
@@ -261,13 +305,12 @@ SR_PRIV int ezusb_upload_firmware_fx3(struct sr_context *ctx, libusb_device *dev
 	if ((ret = libusb_set_configuration(hdl, configuration)) < 0) {
 		sr_err("Unable to set configuration: %s",
 				libusb_error_name(ret));
+		libusb_close(hdl);
 		return SR_ERR;
 	}
 
-	if (ezusb_install_firmware_fx3(ctx, hdl, name) < 0)
-		return SR_ERR;
-
+	ret = ezusb_install_firmware_fx3(ctx, hdl, name);
 	libusb_close(hdl);
 
-	return SR_OK;
+	return ret == SR_OK ? SR_OK : SR_ERR;
 }
