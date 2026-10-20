@@ -22,6 +22,10 @@
 #include "protocol.h"
 #include <math.h>
 
+/* Firmware uploads per scan before giving up on a device that never comes
+ * back with the firmware (each upload rescans the whole bus). */
+#define MAX_FW_UPLOADS 4
+
 static const struct cypress_fx3_profile supported_fx3[] = {
 	/*
 	 * Cypress FX3
@@ -98,7 +102,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 	struct libusb_device_descriptor des;
 	libusb_device **devlist;
 	struct libusb_device_handle *hdl;
-	int ret, i, j;
+	int ret, i, j, fw_uploads = 0;
 	int num_logic_channels = 0, num_analog_channels = 0;
 	const char *conn;
 	char manufacturer[64], product[64], serial_num[64], connection_id[64];
@@ -157,6 +161,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 				sizeof(manufacturer))) < 0) {
 			sr_warn("Failed to get manufacturer string descriptor: %s.",
 				libusb_error_name(ret));
+			libusb_close(hdl);
 			continue;
 		}
 
@@ -167,6 +172,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 				sizeof(product))) < 0) {
 			sr_warn("Failed to get product string descriptor: %s.",
 				libusb_error_name(ret));
+			libusb_close(hdl);
 			continue;
 		}
 
@@ -177,6 +183,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 				sizeof(serial_num))) < 0) {
 			sr_warn("Failed to get serial number string descriptor: %s.",
 				libusb_error_name(ret));
+			libusb_close(hdl);
 			continue;
 		}
 
@@ -253,18 +260,29 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 			sdi->conn = sr_usb_dev_inst_new(libusb_get_bus_number(devlist[i]),
 					libusb_get_device_address(devlist[i]), NULL);
 		} else {
-			if (ezusb_upload_firmware_fx3(drvc->sr_ctx, devlist[i],
+			if (fw_uploads >= MAX_FW_UPLOADS) {
+				sr_err("Device %d.%d (logical) still has no firmware "
+				       "after %d uploads.",
+				       libusb_get_bus_number(devlist[i]),
+				       libusb_get_device_address(devlist[i]),
+				       fw_uploads);
+			} else if (ezusb_upload_firmware_fx3(drvc->sr_ctx, devlist[i],
 					USB_CONFIGURATION, prof->firmware) == SR_OK) {
-				/* Store when this device's FW was updated. */
-				devc->fw_updated = g_get_monotonic_time();
-				/*Add delay for the device to re-enumerat in SuperSpeed*/
+				fw_uploads++;
+				/* Add delay for the device to re-enumerate in SuperSpeed. */
 				g_usleep(1000 * 1000);
+				/*
+				 * The device re-enumerates (as a SuperSpeed device)
+				 * with the firmware: drop this instance, then rescan
+				 * a fresh device list from its first entry.
+				 */
 				devices = g_slist_remove(devices, sdi);
-				/* Rescan and refresh the device list. 
-				   This is needed as the device renumerates as a SuperSpeed device */
+				g_free(sdi->priv);
+				sdi->priv = NULL;
+				sr_dev_inst_free(sdi);
+				libusb_free_device_list(devlist, 1);
 				libusb_get_device_list(drvc->sr_ctx->libusb_ctx, &devlist);
-				/* Restart the iteration */
-				i = 0;
+				i = -1; /* the loop's i++ makes it 0 */
 				continue;
 			} else {
 				sr_err("Firmware upload failed for "
