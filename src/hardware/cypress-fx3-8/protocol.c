@@ -33,7 +33,6 @@ struct cmd_start_acquisition {
 	uint16_t sampling_factor;
 };
 static size_t get_buffer_size(struct dev_context *devc) ;
-SR_PRIV int soft_trigger_logic_check8bit(struct soft_trigger_logic *stl,uint8_t *buf, int len, int *pre_trigger_samples) ;
 #pragma pack(pop)
 
 #define USB_TIMEOUT 100
@@ -468,8 +467,16 @@ check_trigger:
 			processed_samples += num_samples;
 		}
 	} else {
-		trigger_offset = soft_trigger_logic_check8bit(devc->stl,transfer->buffer + processed_samples * unitsize,transfer->actual_length - processed_samples * unitsize,&pre_trigger_samples);
-		
+		/*
+		 * soft_trigger_logic_check(), not ..._check8bit(): the 8bit
+		 * variant never fires an edge on the first sample of a transfer
+		 * (SOFT_TRIG_EDGE_ACROSS_BUFFERS 0), so an edge exactly on a USB
+		 * transfer boundary was missed. Samples here are 1 byte.
+		 */
+		trigger_offset = soft_trigger_logic_check(devc->stl,
+			transfer->buffer + processed_samples * unitsize,
+			transfer->actual_length - processed_samples * unitsize,
+			&pre_trigger_samples);
 		if (trigger_offset > -1) {
 			std_session_send_df_frame_begin(sdi);
 			devc->sent_samples += pre_trigger_samples;
