@@ -23,7 +23,7 @@
 #include "protocol.h"
 
 #pragma pack(push, 1)
-long int total_receive ;
+static long int total_receive;
 struct version_info {
 	uint8_t major;
 	uint8_t minor;
@@ -33,7 +33,6 @@ struct cmd_start_acquisition {
 	uint16_t sampling_factor;
 };
 static size_t get_buffer_size(struct dev_context *devc) ;
-struct sr_dev_inst *Current_sdi=0 ;
 #pragma pack(pop)
 
 #define USB_TIMEOUT 100
@@ -394,7 +393,6 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	unsigned int num_samples;
 	int trigger_offset, cur_sample_count, unitsize, processed_samples;
 	int pre_trigger_samples;
-	size_t ttt ;
 
 	sdi = transfer->user_data;
 	devc = sdi->priv;
@@ -429,7 +427,6 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 		packet_has_error = TRUE;
 		break;
 	}
-	ttt= get_buffer_size(devc) ;
 	//This code using to remove some data at begining because data at this time not stable
 //	if (total_receive/4l < (long int )ttt )
 //	{ resubmit_transfer(transfer);
@@ -529,7 +526,6 @@ static int configure_channels(const struct sr_dev_inst *sdi)
 	const GSList *l;
 	int p;
 	struct sr_channel *ch;
-	uint32_t channel_mask = 0, num_analog = 0;
 
 	devc = sdi->priv;
 
@@ -540,11 +536,8 @@ static int configure_channels(const struct sr_dev_inst *sdi)
 		ch = l->data;
 		if ((p <= NUM_CHANNELS) && (ch->type == SR_CHANNEL_ANALOG)
 				&& (ch->enabled)) {
-			num_analog++;
 			devc->enabled_analog_channels =
 			    g_slist_append(devc->enabled_analog_channels, ch);
-		} else {
-			channel_mask |= ch->enabled << p;
 		}
 	}
 
@@ -648,7 +641,7 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 	num_transfers = get_number_of_transfers(devc);
 
 	size = get_buffer_size(devc);
-	sr_info("num_transfers: %d, buffer_size: %d", num_transfers,size);
+	sr_info("num_transfers: %u, buffer_size: %zu", (unsigned int)num_transfers, size);
 	devc->submitted_transfers = 0;
 
 	devc->transfers = g_try_malloc0(sizeof(*devc->transfers) * num_transfers);
@@ -726,7 +719,6 @@ SR_PRIV int cypress_fx3_start_acquisition(const struct sr_dev_inst *sdi)
 	struct dev_context *devc;
 	int timeout, ret;
 	size_t size;
-	Current_sdi=sdi ;
 total_receive = 0 ;
 	di = sdi->driver;
 	drvc = di->context;
