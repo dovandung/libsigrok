@@ -165,6 +165,8 @@ static int dev_open(struct sr_dev_inst *sdi)
 		return SR_ERR;
 	}
 
+	ch32_setup_raw_io(sdi);
+
 	/* also checks that the APP firmware answers */
 	if (ch32_get_version(sdi) != SR_OK) {
 		sr_err("No answer from the device; is the OpenSourceLogic-CH32H417 "

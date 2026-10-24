@@ -31,6 +31,18 @@ different protocol). The APP enumerates as `1a86:5537` (USB 2) or
   samples are sent in volts (0 ... 3.3 V). Rate 40 MHz / (div + 1), the
   nearest to the selected sample rate, 1 ... 20 MS/s.
 
+## Windows / libusb
+
+Works with this tree's USB event source on stock libusb (no
+`libusb_get_pollfds()` needed) and with the MXE libusb 1.0.30 from
+`contrib/windows-build`. With libusb >= 1.0.30 the driver enables WinUSB
+RAW_IO on EP2 / EP3 itself when the device is opened (log: `RAW_IO enabled
+on ep 0x82, max_raw_io=...`) and keeps transfers under the reported
+maximum, so it does not depend on sigrok's per-read RAW_IO policy
+(`LIBUSB_SIGROK_RAWIO=0` does not affect it). With older libusb, transfers
+are at most 1 MiB, multiples of 16 KiB: under WinUSB's RAW_IO limit, and
+whole USB 3 packets.
+
 ## Not ported
 
 - DSView's 1T glitch filter (no libsigrok config key for it).

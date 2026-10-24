@@ -112,6 +112,9 @@ struct dev_context {
 	/* device */
 	gboolean usb3;		/* firmware runs at super speed */
 	uint8_t sw_ver, hw_ver;
+	/* largest WinUSB RAW_IO read on the data endpoints, 0 = unknown or
+	 * no RAW_IO (libusb >= 1.0.30 on Windows only) */
+	unsigned int raw_io_max;
 
 	/* settings */
 	uint64_t samplerate;
@@ -182,5 +185,6 @@ SR_PRIV size_t ch32_decimate(struct dev_context *devc, const uint8_t *in,
 SR_PRIV int ch32_acquisition_start(const struct sr_dev_inst *sdi);
 SR_PRIV int ch32_acquisition_stop(const struct sr_dev_inst *sdi);
 SR_PRIV void ch32_hw_stop(const struct sr_dev_inst *sdi);
+SR_PRIV void ch32_setup_raw_io(const struct sr_dev_inst *sdi);
 
 #endif

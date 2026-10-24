@@ -832,13 +832,53 @@ static int receive_data(int fd, int revents, void *cb_data)
 
 /* ---------------------------------------------------------- acquisition */
 
-/* bytes per transfer: about 10 ms of data, multiple of 16 KiB */
-static unsigned int transfer_size(uint64_t bytes_per_sec)
+/*
+ * Bytes per transfer: about 10 ms of data, a multiple of 16 KiB, at most
+ * 1 MiB. A multiple of 16 KiB divides by the USB3 packet size (1024), as
+ * WinUSB RAW_IO requires, and by 512, so sigrok's patched libusb (MXE) also
+ * puts these reads in RAW_IO mode. 1 MiB stays under WinUSB's RAW_IO maximum
+ * (about 2 MiB) where it cannot be queried (libusb < 1.0.30); where it can,
+ * transfers are kept under the reported value.
+ */
+static unsigned int transfer_size(const struct dev_context *devc,
+		uint64_t bytes_per_sec)
 {
-	uint64_t s = bytes_per_sec / 100;
+	uint64_t s = bytes_per_sec / 100, max = 1024 * 1024;
 
+	if (devc->raw_io_max && devc->raw_io_max < max)
+		max = devc->raw_io_max & ~16383u;
 	s = (s + 16383) & ~UINT64_C(16383);
-	return (unsigned int)MAX(MIN(s, (uint64_t)1024 * 1024), (uint64_t)16384);
+	return (unsigned int)MAX(MIN(s, max), (uint64_t)16384);
+}
+
+/*
+ * libusb >= 1.0.30, Windows / WinUSB: RAW_IO on the data endpoints. Without
+ * it WinUSB keeps a single bulk IN read in flight (libusb #490), too slow
+ * for 400 MB/s; with it the queued reads stay in flight. Endpoints set up
+ * here are also left alone by sigrok's per-read RAW_IO policy in the
+ * patched MXE libusb. Elsewhere libusb returns an error and nothing changes.
+ */
+SR_PRIV void ch32_setup_raw_io(const struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
+#if defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x0100010C)
+	struct sr_usb_dev_inst *usb = sdi->conn;
+	const uint8_t eps[] = { CH32_EP_LOGIC_IN, CH32_EP_ADC_IN };
+	unsigned int i;
+	int max;
+
+	devc->raw_io_max = 0;
+	for (i = 0; i < ARRAY_SIZE(eps); i++) {
+		if (libusb_endpoint_set_raw_io(usb->devhdl, eps[i], 1) != LIBUSB_SUCCESS)
+			continue;
+		max = libusb_get_max_raw_io_transfer_size(usb->devhdl, eps[i]);
+		sr_info("RAW_IO enabled on ep 0x%02x, max_raw_io=%d.", eps[i], max);
+		if (max > 0 && (!devc->raw_io_max || (unsigned int)max < devc->raw_io_max))
+			devc->raw_io_max = (unsigned int)max;
+	}
+#else
+	devc->raw_io_max = 0;
+#endif
 }
 
 static void send_samplerate_meta(const struct sr_dev_inst *sdi, uint64_t rate)
@@ -985,7 +1025,7 @@ SR_PRIV int ch32_acquisition_start(const struct sr_dev_inst *sdi)
 
 	devc->state = devc->have_trigger ? CH32_ARMED : CH32_STREAMING;
 
-	size = transfer_size(devc->hw_rate * devc->unit);
+	size = transfer_size(devc, devc->hw_rate * devc->unit);
 	devc->transfers = g_malloc0(sizeof(*devc->transfers) * CH32_NUM_TRANSFERS);
 	devc->num_transfers = CH32_NUM_TRANSFERS;
 
