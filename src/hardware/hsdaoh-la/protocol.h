@@ -18,10 +18,13 @@
  */
 
 /*
- * hsdaoh-la: 8 channel logic analyzer made of a Raspberry Pi Pico 2 (RP2350)
- * running the hsdaoh-rp2350 "la8" firmware and an MS2130 USB3 HDMI capture
- * stick. The Pico samples GP0..GP7 continuously and streams every sample
- * over HDMI; libhsdaoh receives the stream on the PC.
+ * hsdaoh-la: logic analyzer made of a Raspberry Pi Pico 2 (RP2350) running
+ * the hsdaoh-rp2350 "la8" firmware (8 channels GP0..GP7, up to 140 MS/s) or
+ * "la4" firmware (4 channels GP0..GP3, up to 280 MS/s) and an MS2130 USB3
+ * HDMI capture stick. The Pico samples continuously and streams every sample
+ * over HDMI; libhsdaoh receives the stream on the PC. The channel count comes
+ * from the Pico's status line; each buffer is unpacked by its stream format
+ * (PIO_8BIT: 2 samples per 16-bit word, PIO_4BIT: 4 samples per word).
  *
  * Acquisition model (kept simple on purpose):
  *   - the stream is scanned on the PC for the trigger condition
@@ -46,7 +49,16 @@
 
 #define LOG_PREFIX "hsdaoh-la"
 
+/* channels: la8 firmware 8 (GP0..GP7), la4 firmware 4 (GP0..GP3) */
 #define HSDAOH_LA_NUM_CHANNELS		8
+#define HSDAOH_LA_LA4_CHANNELS		4
+/* stream formats (from libhsdaoh's hsdaoh.h; older headers have no
+ * format in the callback data, la8 is assumed then) */
+#ifdef HSDAOH_FORMAT_PIO_4BIT
+#define HSDAOH_LA_HAVE_FORMAT		1
+#else
+#define HSDAOH_LA_HAVE_FORMAT		0
+#endif
 /* used until the device has reported its rate in the stream metadata */
 #define HSDAOH_LA_DEFAULT_SAMPLERATE	SR_MHZ(140)
 /* the la8 firmware's divider range */
@@ -76,6 +88,7 @@ struct dev_context {
 	/* device */
 	uint32_t hsdaoh_index;
 	hsdaoh_dev_t *hsdaoh;
+	unsigned int channels;		/* 8 (la8) or 4 (la4; from the Pico's status) */
 	/*
 	 * The HDMI stream is started by the first acquisition and kept
 	 * running until the device is closed: no new synchronization (and
@@ -89,8 +102,14 @@ struct dev_context {
 	/* optional Pico USB serial port for setting the sample rate */
 	struct sr_serial_dev_inst *serial;
 	uint64_t sys_clock;		/* Pico system clock in Hz (0 = unknown) */
-	unsigned int min_div;		/* smallest divider the firmware accepts */
+	unsigned int min_div;		/* smallest divider the firmware accepts
+					 * (la48: in its fastest, 4 channel mode) */
 	unsigned int cur_div;
+	/* la48 firmware: 8 or 4 channels, switched with "ch 8" / "ch 4" */
+	gboolean switchable;
+	unsigned int fw_channels;	/* mode the Pico is in now */
+	unsigned int min_div8, min_div4;	/* smallest divider per mode */
+	unsigned int want_div;		/* divider for the next acquisition (0 = cur_div) */
 	uint64_t *samplerate_list;
 	unsigned int num_samplerates;
 
@@ -99,9 +118,11 @@ struct dev_context {
 	uint64_t limit_samples;
 	uint64_t capture_ratio;		/* percent of samples before the trigger */
 
-	/* trigger: tbl[(prev << 8) | cur] != 0 where the condition is met */
+	/* trigger (first stage): a sample 'cur' after 'prev' matches when for
+	 * every channel bit: zero -> 0, one -> 1, rise -> 0 then 1, fall ->
+	 * 1 then 0, edge -> changed */
 	gboolean have_trigger;
-	uint8_t *trig_tbl;
+	uint8_t trig_zero, trig_one, trig_rise, trig_fall, trig_edge;
 
 	/* capture (written by the libhsdaoh thread, read by the session thread
 	 * once state is HL_DONE / HL_FAILED) */
