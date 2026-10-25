@@ -10,10 +10,10 @@ index 7a2fa04..026efa7 100755
 +# libsigrok, with the hsdaoh-la driver
  $ECHO "component libsigrok ..."
 -$GIT_CLONE $REPO_BASE/libsigrok
-+$GIT_CLONE -b hsdaoh-la https://github.com/dovandung/libsigrok libsigrok
++$GIT_CLONE https://github.com/dovandung/libsigrok libsigrok
 +# hsdaoh-la driver dependencies: libuvc and libhsdaoh (static)
 +export TOOLCHAIN_TRIPLET PREFIX CMAKE PARALLEL V
-+sh libsigrok/src/hardware/hsdaoh-la/mxe-build-deps.sh
++HSDAOH_LIBUSB=mxe sh libsigrok/src/hardware/hsdaoh-la/mxe-build-deps.sh
  cd libsigrok
  ./autogen.sh
  ./configure $C $L

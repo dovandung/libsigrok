@@ -82,9 +82,10 @@ static and 32-bit by default (`TARGET="i686"`; `x86_64` for 64-bit).
        cd sigrok-util
        patch -p1 < .../sigrok-cross-mingw.patch
 
-   It makes the script clone this libsigrok branch (`hsdaoh-la` of
-   github.com/dovandung/libsigrok) and run `mxe-build-deps.sh` before
-   building libsigrok.
+   It makes the script clone github.com/dovandung/libsigrok (master) and
+   run `mxe-build-deps.sh` (`HSDAOH_LIBUSB=mxe`, so MXE needs libusb 1.0.30)
+   before building libsigrok. Or use `contrib/windows-build/sigrok-cross-mingw`,
+   which already does this.
 3. Run `cross-compile/mingw/sigrok-cross-mingw` as usual.
 
 `mxe-build-deps.sh` builds, statically, into the sigrok prefix:
