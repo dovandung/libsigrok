@@ -120,35 +120,48 @@ SR_PRIV int ch32_apply_vth(const struct sr_dev_inst *sdi)
 
 /* --------------------------------------------------------- sample rates */
 
-/* Firmware Set_Logic_Para_Fun(), USB3: index -> rate */
+/*
+ * Firmware Set_Logic_Para_Fun(), USB3: index -> rate, descending.
+ *
+ * fast8: 8 channel rates above 200 MS/s, firmware version 3 and later
+ * (logic_sys 0x18..0x1B: PLL 300 / 275 / 250 / 225 MHz with the UHSIF clock
+ * undivided). Older firmware runs these codes at its 100 MS/s default, so
+ * they are only used when the firmware reports version 3 or later, the
+ * link is USB3 and only channels D0-D7 are enabled.
+ */
 static const struct {
 	uint8_t sys;
 	uint64_t rate;
+	gboolean fast8;
 } hw_rates[] = {
-	{ 0x00, SR_MHZ(200) },
-	{ 0x01, SR_KHZ(187500) },
-	{ 0x02, SR_MHZ(175) },
-	{ 0x03, SR_KHZ(162500) },
-	{ 0x04, SR_KHZ(156250) },
-	{ 0x05, SR_MHZ(150) },
-	{ 0x06, SR_KHZ(137500) },
-	{ 0x07, SR_MHZ(125) },
-	{ 0x08, SR_KHZ(112500) },
-	{ 0x09, SR_MHZ(100) },
-	{ 0x0a, SR_KHZ(93750) },
-	{ 0x0b, SR_KHZ(87500) },
-	{ 0x0c, SR_KHZ(81250) },
-	{ 0x0d, SR_HZ(78125000) },
-	{ 0x0e, SR_MHZ(75) },
-	{ 0x0f, SR_KHZ(68750) },
-	{ 0x10, SR_MHZ(50) },
-	{ 0x11, SR_MHZ(40) },
-	{ 0x12, SR_MHZ(25) },
-	{ 0x13, SR_MHZ(20) },
-	{ 0x14, SR_KHZ(12500) },
-	{ 0x15, SR_MHZ(10) },
-	{ 0x16, SR_MHZ(8) },
-	{ 0x17, SR_KHZ(6250) },	/* hardware minimum */
+	{ 0x18, SR_MHZ(300), TRUE },
+	{ 0x19, SR_MHZ(275), TRUE },
+	{ 0x1a, SR_MHZ(250), TRUE },
+	{ 0x1b, SR_MHZ(225), TRUE },
+	{ 0x00, SR_MHZ(200), FALSE },
+	{ 0x01, SR_KHZ(187500), FALSE },
+	{ 0x02, SR_MHZ(175), FALSE },
+	{ 0x03, SR_KHZ(162500), FALSE },
+	{ 0x04, SR_KHZ(156250), FALSE },
+	{ 0x05, SR_MHZ(150), FALSE },
+	{ 0x06, SR_KHZ(137500), FALSE },
+	{ 0x07, SR_MHZ(125), FALSE },
+	{ 0x08, SR_KHZ(112500), FALSE },
+	{ 0x09, SR_MHZ(100), FALSE },
+	{ 0x0a, SR_KHZ(93750), FALSE },
+	{ 0x0b, SR_KHZ(87500), FALSE },
+	{ 0x0c, SR_KHZ(81250), FALSE },
+	{ 0x0d, SR_HZ(78125000), FALSE },
+	{ 0x0e, SR_MHZ(75), FALSE },
+	{ 0x0f, SR_KHZ(68750), FALSE },
+	{ 0x10, SR_MHZ(50), FALSE },
+	{ 0x11, SR_MHZ(40), FALSE },
+	{ 0x12, SR_MHZ(25), FALSE },
+	{ 0x13, SR_MHZ(20), FALSE },
+	{ 0x14, SR_KHZ(12500), FALSE },
+	{ 0x15, SR_MHZ(10), FALSE },
+	{ 0x16, SR_MHZ(8), FALSE },
+	{ 0x17, SR_KHZ(6250), FALSE },	/* hardware minimum */
 };
 
 /* rates below the hardware minimum (USB3) or the fixed USB2 clock, made by
@@ -156,6 +169,9 @@ static const struct {
 static const uint64_t soft_rates[] = {
 	SR_MHZ(5), SR_MHZ(2), SR_MHZ(1), SR_KHZ(500), SR_KHZ(200), SR_KHZ(100),
 };
+
+/* firmware version with the 8 channel rates above 200 MS/s */
+#define CH32_FW_FAST8_VERSION	3
 
 /* USB2: the firmware ignores the rate index and runs at a fixed clock */
 #define CH32_USB2_RATE_8BIT	SR_MHZ(40)
@@ -179,7 +195,19 @@ static size_t rate_add(uint64_t *out, size_t n, size_t max, uint64_t r)
 	return n + 1;
 }
 
-/* All selectable rates for the current link, ascending. */
+/* the device has the 8 channel rates above 200 MS/s (USB3, firmware >= 3) */
+SR_PRIV gboolean ch32_has_fast8(const struct dev_context *devc)
+{
+	return devc->usb3 && devc->sw_ver >= CH32_FW_FAST8_VERSION;
+}
+
+/*
+ * All selectable rates for the current link, ascending. Like 40 MS/s on
+ * USB2, the rates above 200 MS/s are listed whatever channels are enabled;
+ * starting an acquisition with one of them and a channel above D7 fails
+ * with an explanation. The firmware version is known once the device is
+ * open, so these rates appear from then on.
+ */
 SR_PRIV size_t ch32_samplerate_list(const struct dev_context *devc,
 		uint64_t *out, size_t max)
 {
@@ -187,7 +215,8 @@ SR_PRIV size_t ch32_samplerate_list(const struct dev_context *devc,
 
 	if (devc->usb3) {
 		for (i = 0; i < ARRAY_SIZE(hw_rates); i++)
-			n = rate_add(out, n, max, hw_rates[i].rate);
+			if (!hw_rates[i].fast8 || ch32_has_fast8(devc))
+				n = rate_add(out, n, max, hw_rates[i].rate);
 	} else {
 		/* 40 MS/s only with channels 0..7 enabled */
 		n = rate_add(out, n, max, CH32_USB2_RATE_8BIT);
@@ -207,6 +236,7 @@ SR_PRIV size_t ch32_samplerate_list(const struct dev_context *devc,
 SR_PRIV int ch32_map_samplerate(struct dev_context *devc, uint64_t rate,
 		unsigned int logic_bit)
 {
+	gboolean fast8;
 	int i;
 
 	if (!rate)
@@ -223,7 +253,10 @@ SR_PRIV int ch32_map_samplerate(struct dev_context *devc, uint64_t rate,
 		return SR_OK;
 	}
 
+	fast8 = logic_bit == 8 && ch32_has_fast8(devc);
 	for (i = 0; i < (int)ARRAY_SIZE(hw_rates); i++) {
+		if (hw_rates[i].fast8 && !fast8)
+			continue;
 		if (hw_rates[i].rate == rate) {
 			devc->logic_sys = hw_rates[i].sys;
 			devc->hw_rate = rate;
@@ -233,6 +266,8 @@ SR_PRIV int ch32_map_samplerate(struct dev_context *devc, uint64_t rate,
 	}
 	/* table is descending: search from the lowest rate up */
 	for (i = ARRAY_SIZE(hw_rates) - 1; i >= 0; i--) {
+		if (hw_rates[i].fast8 && !fast8)
+			continue;
 		if (hw_rates[i].rate > rate && hw_rates[i].rate % rate == 0) {
 			devc->logic_sys = hw_rates[i].sys;
 			devc->hw_rate = hw_rates[i].rate;
@@ -954,13 +989,24 @@ static int setup_acquisition(const struct sr_dev_inst *sdi)
 		return SR_OK;
 	}
 
-	/* channels 8..15 need 16-bit samples (half the rate on USB2) */
+	/* channels 8..15 need 16-bit samples: half the rate on USB2, and no
+	 * rates above 200 MS/s on USB3 */
 	devc->logic_bit = (max_index >= 8) ? 16 : 8;
 	devc->unit = devc->logic_bit / 8;
 	if (ch32_map_samplerate(devc, devc->samplerate, devc->logic_bit) != SR_OK) {
-		sr_err("%" PRIu64 " S/s is not available with channels above "
-			"D7 on a USB 2 connection; use channels D0-D7 only, "
-			"a lower rate, or a USB 3 port.", devc->samplerate);
+		if (devc->usb3 && devc->samplerate > SR_MHZ(200) &&
+		    !ch32_has_fast8(devc))
+			sr_err("%" PRIu64 " S/s needs firmware version %d or "
+				"later (this device has %u).", devc->samplerate,
+				CH32_FW_FAST8_VERSION, devc->sw_ver);
+		else if (devc->usb3)
+			sr_err("%" PRIu64 " S/s works with channels D0-D7 only; "
+				"disable D8-D15 or use 200 MS/s or less.",
+				devc->samplerate);
+		else
+			sr_err("%" PRIu64 " S/s is not available with channels above "
+				"D7 on a USB 2 connection; use channels D0-D7 only, "
+				"a lower rate, or a USB 3 port.", devc->samplerate);
 		return SR_ERR_SAMPLERATE;
 	}
 

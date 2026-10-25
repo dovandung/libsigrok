@@ -170,6 +170,7 @@ SR_PRIV int ch32_get_version(const struct sr_dev_inst *sdi);
 SR_PRIV int ch32_apply_vth(const struct sr_dev_inst *sdi);
 SR_PRIV uint16_t ch32_vth_to_dac(double v);
 
+SR_PRIV gboolean ch32_has_fast8(const struct dev_context *devc);
 SR_PRIV size_t ch32_samplerate_list(const struct dev_context *devc,
 		uint64_t *out, size_t max);
 SR_PRIV int ch32_map_samplerate(struct dev_context *devc, uint64_t rate,

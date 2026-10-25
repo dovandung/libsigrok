@@ -13,7 +13,10 @@ different protocol). The APP enumerates as `1a86:5537` (USB 2) or
 ## Features
 
 - Sample rates: USB 3 — the 24 firmware rates from 200 MS/s down to
-  6.25 MS/s, plus 5 MS/s ... 100 kS/s made on the PC. USB 2 — the firmware
+  6.25 MS/s, plus 5 MS/s ... 100 kS/s made on the PC. With firmware
+  version 3 or later, also 225 / 250 / 275 / 300 MS/s with channels D0-D7
+  only (listed once the device is open; older firmware would run these
+  rate codes at 100 MS/s, so they are not offered). USB 2 — the firmware
   runs at a fixed 40 MS/s (channels D0-D7 only) or 20 MS/s (any channel
   above D7), lower rates are made on the PC. Rates made on the PC use a
   per-channel majority vote over the decimation window, not 1-of-N picking.
