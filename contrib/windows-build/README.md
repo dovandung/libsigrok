@@ -39,28 +39,36 @@ sizes its transfers under the reported maximum.
 
 ## How to build
 
-1. **MXE**, once:
+1. **MXE**, once: put libusb 1.0.30 into MXE. Copy the two whole files
+   from this folder (they replace whatever libusb recipe MXE has, also one
+   changed by sigrok-util's old `libusb1_upgrade.patch`):
 
+       cp libusb1.mk libusb1-1-fixes.patch ~/mxe-git/src/
        cd ~/mxe-git
-       git checkout src/libusb1.mk && rm -f src/libusb1-1-fixes.patch   # undo sigrok's old libusb patch
-       patch -p1 < .../contrib/windows-build/mxe-libusb1-1.0.30.patch
-       make update-checksum-libusb1
        make MXE_TARGETS=i686-w64-mingw32.static.posix libusb1
+       grep Version usr/i686-w64-mingw32.static.posix/lib/pkgconfig/libusb-1.0.pc   # 1.0.30
 
-   Keep sigrok-util's `mxe_fixes.patch`. Do not apply its
-   `libusb1_upgrade.patch`; this patch replaces it.
+   (or, on a clean MXE with libusb 1.0.27: `patch -p1 <
+   mxe-libusb1-1.0.30.patch` and `make update-checksum-libusb1`). Keep
+   sigrok-util's `mxe_fixes.patch`.
 
-2. **sigrok-cross-mingw**: clone this branch instead of upstream libsigrok,
-   and patch PulseView after its clone:
+2. **Build** with `sigrok-cross-mingw` from this folder. It is sigrok-util's
+   script set up for these trees: libsigrok from this repository,
+   PulseView from github.com/dovandung/pulseview (SLogic option built in),
+   libhsdaoh for hsdaoh-la, the other sigrok repositories from GitHub. It
+   checks MXE's libusb first. Edit `TARGET`, `MXE` and `PREFIXBASE` at the
+   top if needed, then:
 
-       $GIT_CLONE -b <this branch> https://github.com/dovandung/libsigrok.git libsigrok
-       ...
-       $GIT_CLONE $REPO_BASE/pulseview
-       cd pulseview
-       patch -p1 < .../contrib/windows-build/pulseview-slogic-channels.patch || exit 1
+       sh sigrok-cross-mingw
 
-3. Run `sigrok-cross-mingw` as usual. The build is static, so libsigrok and
-   PulseView must be rebuilt whenever MXE's libusb changes.
+   Installers: `build_release_32/pulseview/contrib/` and
+   `build_release_32/sigrok-cli/contrib/`. The build is static, so run it
+   again whenever MXE's libusb changes.
+
+   With sigrok-util's own script instead: clone this libsigrok, run
+   `src/hardware/hsdaoh-la/mxe-build-deps.sh` (`HSDAOH_LIBUSB=mxe`) before
+   its configure, and clone github.com/dovandung/pulseview, or apply
+   `pulseview-slogic-channels.patch` to upstream PulseView.
 
 ## Run-time switches
 

@@ -1,0 +1,333 @@
+#!/bin/sh
+##
+## sigrok-cross-mingw for dovandung's sigrok trees: builds PulseView and
+## sigrok-cli Windows installers on Linux with MXE.
+##
+## Based on sigrok-util's cross-compile/mingw/sigrok-cross-mingw
+## (Copyright (C) 2013-2020 Uwe Hermann <uwe@hermann-uwe.de>, GPL v2+),
+## with these changes:
+##   - libsigrok from github.com/dovandung/libsigrok (master): stock libusb
+##     USB code, Sipeed SLogic, Cypress FX3, hsdaoh-la, fast soft trigger
+##   - PulseView from github.com/dovandung/pulseview (master): SLogic
+##     channel-count option built in, no patches to apply
+##   - libhsdaoh + libuvc built first, so the hsdaoh-la driver is included
+##   - all other sigrok repositories from their GitHub mirrors (sigrok.org
+##     git and downloads are not reliable)
+##   - Python 3.4 files, pyconfig.patch and FileAssociation.nsh from
+##     sigrokproject/sigrok-build instead of sigrok.org/tmp
+##   - checks that MXE has libusb 1.0.30 before building anything
+##   - no PulseView manual build (the installer links to the online manual)
+##
+## Needs: MXE with libusb 1.0.30 (contrib/windows-build/README.md, step 1),
+## and on the host: git, wget, unzip, autotools, sdcc (fx2lafw firmware),
+## nsis (makensis).
+##
+## Usage: edit the settings below, then run  sh sigrok-cross-mingw
+## The installers end up in $BUILDDIR/pulseview/contrib/ and
+## $BUILDDIR/sigrok-cli/contrib/.
+##
+## This program is free software; you can redistribute it and/or modify
+## it under the terms of the GNU General Public License as published by
+## the Free Software Foundation; either version 2 of the License, or
+## (at your option) any later version.
+##
+
+set -e
+
+# Build target: "i686" (32bit) or "x86_64" (64bit).
+TARGET="i686"
+
+# The path where your MXE directory is located.
+MXE=$HOME/mxe-git
+
+# The base path prefix where the cross-compiled packages will be installed.
+PREFIXBASE=$HOME/sr_mingw
+
+# The base path prefix where to download files to and where to build packages.
+BUILDBASE=./build
+
+# Edit this to control verbose build output.
+# V="V=1 VERBOSE=1"
+
+# Edit this to enable/disable/modify parallel compiles.
+PARALLEL="-j$(nproc 2>/dev/null || echo 2)"
+
+# Edit this to enable/disable debug builds.
+DEBUG=0
+
+# Repositories and branches.
+LIBSIGROK_REPO="https://github.com/dovandung/libsigrok.git"
+LIBSIGROK_BRANCH="master"
+PULSEVIEW_REPO="https://github.com/dovandung/pulseview.git"
+PULSEVIEW_BRANCH="master"
+SIGROK_GITHUB="https://github.com/sigrokproject"
+
+# 1 = build libhsdaoh and the hsdaoh-la driver, 0 = leave it out.
+# If libhsdaoh fails to build, the script goes on without the driver.
+WITH_HSDAOH=1
+
+# 1 = also build the sigrok-cli installer.
+WITH_SIGROK_CLI=1
+
+# Optionally show some progress as the script executes.
+# ECHO=true
+ECHO=echo
+
+# You usually don't need to change anything below this line.
+
+# -----------------------------------------------------------------------------
+
+$ECHO "setting up fetch variables ..."
+
+WGET="wget -c --quiet"
+GIT_CLONE="git clone --depth=1"
+
+# Construct the build and install directory pathnames.
+if [ $TARGET = "i686" ]; then
+	SUFFIX="32"
+else
+	SUFFIX="64"
+fi
+if [ $DEBUG = 1 ]; then
+	# CFLAGS/CXXFLAGS contains "-g" per default for autotools projects.
+	BUILD_TYPE="Debug"
+	PREFIX=$PREFIXBASE"_debug_"$SUFFIX
+	BUILDDIR=$BUILDBASE"_debug_"$SUFFIX
+else
+	BUILD_TYPE="Release"
+	PREFIX=$PREFIXBASE"_release_"$SUFFIX
+	BUILDDIR=$BUILDBASE"_release_"$SUFFIX
+fi
+
+# -----------------------------------------------------------------------------
+
+$ECHO "setting up toolchain variables ..."
+
+# We need to find tools in the toolchain.
+export PATH=$MXE/usr/bin:$PATH
+
+TOOLCHAIN_TRIPLET="$TARGET-w64-mingw32.static.posix"
+
+CMAKE="$TOOLCHAIN_TRIPLET-cmake"
+
+P="$PREFIX/lib/pkgconfig"
+P2="$MXE/usr/$TOOLCHAIN_TRIPLET/lib/pkgconfig"
+C="--host=$TOOLCHAIN_TRIPLET --prefix=$PREFIX CPPFLAGS=-D__printf__=__gnu_printf__"
+L="--disable-shared --enable-static"
+
+if [ $TARGET = "i686" ]; then
+	export PKG_CONFIG_PATH_i686_w64_mingw32_static_posix="$P:$P2"
+else
+	export PKG_CONFIG_PATH_x86_64_w64_mingw32_static_posix="$P:$P2"
+fi
+
+# MXE must have the target toolchain and libusb 1.0.30.
+if ! command -v $TOOLCHAIN_TRIPLET-gcc >/dev/null; then
+	echo "ERROR: $TOOLCHAIN_TRIPLET-gcc not found in $MXE/usr/bin."
+	echo "Build MXE for this target first (MXE_TARGETS=$TOOLCHAIN_TRIPLET)."
+	exit 1
+fi
+LIBUSB_VERSION=$($TOOLCHAIN_TRIPLET-pkg-config --modversion libusb-1.0 2>/dev/null || true)
+case "$LIBUSB_VERSION" in
+1.0.3[0-9]*) $ECHO "MXE libusb: $LIBUSB_VERSION" ;;
+*)
+	echo "ERROR: MXE's libusb is '${LIBUSB_VERSION:-missing}', need 1.0.30."
+	echo "Copy libusb1.mk and libusb1-1-fixes.patch into $MXE/src/ and run:"
+	echo "  make -C $MXE MXE_TARGETS=$TOOLCHAIN_TRIPLET libusb1"
+	echo "(see contrib/windows-build/README.md in dovandung/libsigrok)."
+	exit 1
+	;;
+esac
+
+# Remove build directory contents (if any) and create a new build dir.
+$ECHO "starting new build directory: $BUILDDIR"
+rm -rf $BUILDDIR
+mkdir -p $BUILDDIR
+cd $BUILDDIR
+
+# -----------------------------------------------------------------------------
+
+mkdir -p $PREFIX
+
+# Python 3.4 for Windows, pyconfig.patch, FileAssociation.nsh: from sigrok-build.
+$ECHO "fetching sigrok-build (Python 3.4 files, NSIS helper) ..."
+$GIT_CLONE $SIGROK_GITHUB/sigrok-build.git sigrok-build
+CONTRIB=$PWD/sigrok-build/ci/mxe/contrib-mxe
+
+$ECHO "preparing Python dependency ..."
+
+# Cross-compiling Python is highly non-trivial, so we avoid it for now.
+# Python34_*.tar.gz is a repackaged tarball of the official Python 3.4.4 MSI
+# installer for Windows (c:\Python34\libs and c:\Python34\include).
+cp $CONTRIB/Python34_$TARGET.tar.gz $PREFIX/Python34.tar.gz
+tar xzf $PREFIX/Python34.tar.gz -C $PREFIX
+
+# Fix for bug #1195.
+if [ $TARGET = "x86_64" ]; then
+	patch -p1 $PREFIX/Python34/include/pyconfig.h < $CONTRIB/pyconfig.patch
+fi
+
+# Create a dummy python3.pc file so that pkg-config finds Python 3.
+mkdir -p $PREFIX/lib/pkgconfig
+cat >$PREFIX/lib/pkgconfig/python3.pc <<EOF
+prefix=$PREFIX
+exec_prefix=\${prefix}
+libdir=\${exec_prefix}/Python34/libs
+includedir=\${prefix}/Python34/include
+Name: Python
+Description: Python library
+Version: 3.4.4
+Libs: -L\${libdir} -lpython34
+Cflags: -I\${includedir}
+EOF
+
+# python34.dll and python34.zip are shipped in the NSIS installers (needed
+# for protocol decoders).
+cp $CONTRIB/python34_$TARGET.dll $PREFIX/python34.dll
+cp $CONTRIB/python34_$TARGET.zip $PREFIX/python34.zip
+
+# In order to link against Python we need libpython34.a.
+# The upstream Python 32bit installer ships this, the x86_64 installer
+# doesn't. Thus, we generate the file manually here.
+if [ $TARGET = "x86_64" ]; then
+	cp $PREFIX/python34.dll .
+	$MXE/usr/$TARGET-w64-mingw32.static.posix/bin/gendef python34.dll
+	$MXE/usr/bin/$TARGET-w64-mingw32.static.posix-dlltool \
+		--dllname python34.dll --def python34.def \
+		--output-lib libpython34.a
+	mv -f libpython34.a $PREFIX/Python34/libs
+	rm -f python34.dll python34.def
+fi
+
+# We need to include the *.pyd files from python34.zip into the installers,
+# otherwise importing certain modules (e.g. ctypes) won't work (bug #1409).
+unzip -q -o $PREFIX/python34.zip '*.pyd' -d $PREFIX
+
+# Zadig (we ship this with frontends for easy driver switching).
+$ECHO "fetching zadig ..."
+$WGET https://github.com/pbatard/libwdi/releases/download/b721/zadig-2.4.exe -O $PREFIX/zadig.exe
+$WGET https://github.com/pbatard/libwdi/releases/download/v1.2.5/zadig_xp-2.2.exe -O $PREFIX/zadig_xp.exe
+
+# libserialport
+$ECHO "component libserialport ..."
+$GIT_CLONE $SIGROK_GITHUB/libserialport.git libserialport
+cd libserialport
+./autogen.sh
+./configure $C $L
+make $PARALLEL $V
+make install $V
+cd ..
+
+# libsigrok (dovandung)
+$ECHO "component libsigrok ($LIBSIGROK_REPO $LIBSIGROK_BRANCH) ..."
+$GIT_CLONE -b $LIBSIGROK_BRANCH $LIBSIGROK_REPO libsigrok
+
+# hsdaoh-la driver dependencies: libuvc + libhsdaoh, static, into $PREFIX.
+# HSDAOH_LIBUSB=mxe: built against MXE's libusb 1.0.30, shared with libsigrok.
+if [ $WITH_HSDAOH = 1 ]; then
+	$ECHO "component libhsdaoh (for hsdaoh-la) ..."
+	export TOOLCHAIN_TRIPLET PREFIX CMAKE PARALLEL V
+	if ! HSDAOH_LIBUSB=mxe sh libsigrok/src/hardware/hsdaoh-la/mxe-build-deps.sh; then
+		echo "WARNING: libhsdaoh failed to build, hsdaoh-la is left out."
+		rm -f $PREFIX/lib/pkgconfig/libhsdaoh.pc
+	fi
+fi
+
+cd libsigrok
+./autogen.sh
+./configure $C $L
+make $PARALLEL $V
+make install $V
+# Show which of the added drivers were built ('' = yes, '#' = no).
+grep -E "^HW_(SIPEED_SLOGIC_ANALYZER|CYPRESS_FX3_16|CYPRESS_FX3_8|HSDAOH_LA|FX2LAFW)_TRUE=" config.log || true
+cd ..
+
+# libsigrokdecode
+$ECHO "component libsigrokdecode ..."
+$GIT_CLONE $SIGROK_GITHUB/libsigrokdecode.git libsigrokdecode
+cd libsigrokdecode
+./autogen.sh
+./configure $C $L
+make $PARALLEL $V
+make install $V
+cd ..
+
+# sigrok-firmware
+$ECHO "component sigrok-firmware ..."
+$GIT_CLONE $SIGROK_GITHUB/sigrok-firmware.git sigrok-firmware
+cd sigrok-firmware
+./autogen.sh
+# Nothing gets cross-compiled here, we just need 'make install' basically.
+./configure --prefix=$PREFIX
+make install $V
+cd ..
+
+# sigrok-firmware-fx2lafw
+$ECHO "component sigrok-firmware-fx2lafw ..."
+$GIT_CLONE $SIGROK_GITHUB/sigrok-firmware-fx2lafw.git sigrok-firmware-fx2lafw
+cd sigrok-firmware-fx2lafw
+./autogen.sh
+# We're building the fx2lafw firmware on the host, no need to cross-compile.
+./configure --prefix=$PREFIX
+make $PARALLEL $V
+make install $V
+cd ..
+
+# Cypress FX3 firmware is not in any repository: copy cypress-fx3.fw and
+# cypress-fx3-8.fw into $PREFIX/share/sigrok-firmware/ before the installer
+# step below if you have them, and they are packaged too.
+
+# sigrok-dumps
+$ECHO "component sigrok-dumps ..."
+$GIT_CLONE $SIGROK_GITHUB/sigrok-dumps.git sigrok-dumps
+cd sigrok-dumps
+make install PREFIX=$PREFIX $V
+cd ..
+
+# sigrok-cli
+if [ $WITH_SIGROK_CLI = 1 ]; then
+	$ECHO "component sigrok-cli ..."
+	$GIT_CLONE $SIGROK_GITHUB/sigrok-cli.git sigrok-cli
+	cd sigrok-cli
+	./autogen.sh
+	./configure $C
+	make $PARALLEL $V
+	make install $V
+	cp $CONTRIB/FileAssociation.nsh contrib
+	if [ $TARGET = "i686" ]; then
+		makensis contrib/sigrok-cli_cross.nsi
+	else
+		makensis -DPE64=1 contrib/sigrok-cli_cross.nsi
+	fi
+	cd ..
+fi
+
+# PulseView (dovandung: SLogic channel-count option built in)
+$ECHO "component pulseview ($PULSEVIEW_REPO $PULSEVIEW_BRANCH) ..."
+$GIT_CLONE -b $PULSEVIEW_BRANCH $PULSEVIEW_REPO pulseview
+cd pulseview
+cp $CONTRIB/FileAssociation.nsh contrib
+$CMAKE \
+	-DCMAKE_INSTALL_PREFIX:PATH=$PREFIX \
+	-DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+	-DDISABLE_WERROR=y \
+	-DENABLE_TESTS=n \
+	.
+make $PARALLEL $V
+if [ $DEBUG = 1 ]; then
+	make install $V
+else
+	make install/strip $V
+fi
+
+$ECHO "creating NSIS installer ..."
+if [ $TARGET = "i686" ]; then
+	makensis contrib/pulseview_cross.nsi
+else
+	makensis -DPE64=1 contrib/pulseview_cross.nsi
+fi
+cd ..
+
+$ECHO "cross compile script done."
+$ECHO "installers:"
+ls -1 $PWD/pulseview/contrib/*installer.exe $PWD/sigrok-cli/contrib/*installer.exe 2>/dev/null || true

@@ -1,0 +1,117 @@
+This file is part of MXE. See LICENSE.md for licensing information.
+
+sigrok: use RAW_IO for WinUSB bulk IN transfers whose length is a multiple
+of 512 bytes, for every application. Ported to libusb 1.0.30 from
+sigrok-util's libusb1_upgrade.patch (Petteri Aimonen, libusb PR #1069).
+The policy is only changed when it differs from what was last set on the
+pipe (not before every read while others are pending), endpoints an
+application set up with libusb_endpoint_set_raw_io() are left alone, and
+LIBUSB_SIGROK_RAWIO=0 in the environment turns it off.
+
+diff --git a/libusb/os/windows_common.h b/libusb/os/windows_common.h
+index e12b170..db69866 100644
+--- a/libusb/os/windows_common.h
++++ b/libusb/os/windows_common.h
+@@ -292,12 +292,21 @@ enum WINUSB_ZLP {
+ 	WINUSB_ZLP_ON = 2
+ };
+ 
++// sigrok: per-endpoint RAW_IO state kept by the per-transfer RAW_IO policy
++enum SIGROK_RAW_IO {
++	SIGROK_RAW_IO_UNSET = 0,
++	SIGROK_RAW_IO_OFF = 1,
++	SIGROK_RAW_IO_ON = 2,
++	SIGROK_RAW_IO_APP = 3 // set by the application, left alone
++};
++
+ struct winusb_device_handle_priv {
+ 	int active_interface;
+ 	struct {
+ 		HANDLE dev_handle; // WinUSB needs an extra handle for the file
+ 		HANDLE api_handle; // used by the API to communicate with the device
+ 		uint8_t zlp[USB_MAXENDPOINTS]; // Current per-endpoint SHORT_PACKET_TERMINATE status (enum WINUSB_ZLP)
++		uint8_t sigrok_raw_io[USB_MAXENDPOINTS]; // enum SIGROK_RAW_IO, by sigrok_ep_index()
+ 	} interface_handle[USB_MAXINTERFACES];
+ 	int autoclaim_count[USB_MAXINTERFACES]; // For auto-release
+ };
+diff --git a/libusb/os/windows_winusb.c b/libusb/os/windows_winusb.c
+index b84c4ac..dcfe2c3 100644
+--- a/libusb/os/windows_winusb.c
++++ b/libusb/os/windows_winusb.c
+@@ -94,6 +94,25 @@ static int composite_endpoint_supports_raw_io(int sub_api, struct libusb_device_
+ static int composite_endpoint_set_raw_io(int sub_api, struct libusb_device_handle* dev_handle, uint8_t endpoint, int enable);
+ static int composite_get_max_raw_io_transfer_size(int sub_api, struct libusb_device_handle* dev_handle, uint8_t endpoint);
+ 
++// sigrok: index of an endpoint address in sigrok_raw_io[] (0..31:
++// endpoint number, IN endpoints in the upper half)
++static uint8_t sigrok_ep_index(uint8_t endpoint)
++{
++	return (uint8_t)((endpoint & 0x0f) | ((endpoint & 0x80) >> 3));
++}
++
++// sigrok: the per-transfer RAW_IO policy, unless LIBUSB_SIGROK_RAWIO=0
++static int sigrok_raw_io_enabled(void)
++{
++	static int enabled = -1;
++
++	if (enabled < 0) {
++		const char *e = getenv("LIBUSB_SIGROK_RAWIO");
++		enabled = !(e && e[0] == '0');
++	}
++	return enabled;
++}
++
+ static usbi_mutex_t autoclaim_lock;
+ 
+ // API globals
+@@ -3137,6 +3156,7 @@ static int winusbx_configure_endpoints(int sub_api, struct libusb_device_handle
+ 
+ 		policy = false;
+ 		handle_priv->interface_handle[iface].zlp[endpoint_address] = WINUSB_ZLP_UNSET;
++		handle_priv->interface_handle[iface].sigrok_raw_io[sigrok_ep_index(endpoint_address)] = SIGROK_RAW_IO_UNSET;
+ 		if (!WinUSBX[sub_api].SetPipePolicy(winusb_handle, endpoint_address,
+ 			SHORT_PACKET_TERMINATE, sizeof(UCHAR), &policy))
+ 			usbi_dbg(HANDLE_CTX(dev_handle), "failed to disable SHORT_PACKET_TERMINATE for endpoint %02X", endpoint_address);
+@@ -3745,6 +3765,33 @@ static int winusbx_submit_bulk_transfer(int sub_api, struct usbi_transfer *itran
+ 	set_transfer_priv_handle(itransfer, handle_priv->interface_handle[current_interface].dev_handle);
+ 	overlapped = get_transfer_priv_overlapped(itransfer);
+ 
++	// sigrok: use RAW_IO for reads whose length is a multiple of 512 bytes,
++	// for every application, as sigrok-util's libusb1_upgrade.patch did for
++	// older libusb (Petteri Aimonen, see libusb PR #1069). RAW_IO only
++	// applies to IN pipes. The policy is changed only when it differs from
++	// what was last set on the pipe, not before every read: a driver that
++	// queues many reads of one size sets it once, before the first one, and
++	// never while reads are pending. Endpoints an application configured
++	// with libusb_endpoint_set_raw_io() are left alone. LIBUSB_SIGROK_RAWIO=0
++	// in the environment turns this off (for comparing).
++	if (sub_api == SUB_API_WINUSB && IS_XFERIN(transfer) && sigrok_raw_io_enabled()) {
++		uint8_t *state = &handle_priv->interface_handle[current_interface]
++			.sigrok_raw_io[sigrok_ep_index(transfer->endpoint)];
++		uint8_t want = (transfer->length % 512 == 0) ? SIGROK_RAW_IO_ON : SIGROK_RAW_IO_OFF;
++
++		if (*state != SIGROK_RAW_IO_APP && *state != want) {
++			UCHAR raw_io = (want == SIGROK_RAW_IO_ON);
++			if (WinUSBX[sub_api].SetPipePolicy(winusb_handle, transfer->endpoint,
++				RAW_IO, sizeof(UCHAR), &raw_io)) {
++				*state = want;
++				usbi_dbg(TRANSFER_CTX(transfer), "sigrok: RAW_IO %s for endpoint %02X",
++					raw_io ? "on" : "off", transfer->endpoint);
++			} else {
++				usbi_err(TRANSFER_CTX(transfer), "failed to set RAW_IO for endpoint %02X", transfer->endpoint);
++			}
++		}
++	}
++
+ 	if (IS_XFERIN(transfer)) {
+ 		// Note: We don't need to handle transfers to pipes with RAW_IO enabled differently,
+ 		// as ReadPipe() already fails if the length argument doesn't satisfy the RAW_IO requirements.
+@@ -4067,6 +4114,8 @@ int winusbx_endpoint_set_raw_io(int sub_api, libusb_device_handle* dev_handle, u
+ 	}
+ 
+ 	usbi_dbg(ctx, "%s RAW_IO for endpoint %02X", enable ? "enabled" : "disabled", endpoint);
++	// sigrok: the application manages RAW_IO here from now on
++	handle_priv->interface_handle[interface].sigrok_raw_io[sigrok_ep_index(endpoint)] = SIGROK_RAW_IO_APP;
+ 
+ 	return LIBUSB_SUCCESS;
+ }
