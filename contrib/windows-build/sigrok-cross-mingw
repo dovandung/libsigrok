@@ -139,6 +139,22 @@ case "$LIBUSB_VERSION" in
 	;;
 esac
 
+# MXE packages this build needs (the list from sigrok-util's README /
+# sigrok-build's MXE image). gendef is only used for 64-bit (Python import
+# library), but is cheap to build for both.
+MXE_PKGS="gcc glib libzip libusb1 libftdi1 hidapi glibmm qtbase qtimageformats \
+	qtsvg qttools qttranslations boost check gendef libieee1284 nettle qwt"
+MISSING=""
+for pkg in $MXE_PKGS; do
+	[ -e "$MXE/usr/$TOOLCHAIN_TRIPLET/installed/$pkg" ] || MISSING="$MISSING $pkg"
+done
+if [ -n "$MISSING" ]; then
+	echo "ERROR: MXE packages missing for $TOOLCHAIN_TRIPLET:$MISSING"
+	echo "Build them with:"
+	echo "  make -C $MXE MXE_TARGETS=$TOOLCHAIN_TRIPLET$MISSING"
+	exit 1
+fi
+
 # Remove build directory contents (if any) and create a new build dir.
 $ECHO "starting new build directory: $BUILDDIR"
 rm -rf $BUILDDIR
