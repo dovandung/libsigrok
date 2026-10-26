@@ -21,10 +21,15 @@
 #include <string.h>
 #include "protocol.h"
 
-/* Stream mode rates. Higher rates need buffer mode, not supported yet. */
+/*
+ * Up to 100 MHz the device streams; faster rates use buffer mode (capture
+ * into on-board memory, then upload).
+ */
 SR_PRIV const uint64_t dl32_samplerates[] = {
 	SR_MHZ(1), SR_MHZ(2), SR_MHZ(4), SR_MHZ(5), SR_MHZ(10),
 	SR_MHZ(20), SR_MHZ(25), SR_MHZ(40), SR_MHZ(50), SR_MHZ(100),
+	SR_MHZ(200), SR_MHZ(250), SR_MHZ(400), SR_MHZ(500), SR_MHZ(800),
+	SR_GHZ(1),
 };
 SR_PRIV const unsigned int dl32_num_samplerates = ARRAY_SIZE(dl32_samplerates);
 
@@ -139,23 +144,71 @@ SR_PRIV void dl32_build_params(uint8_t out[DL32_PARAMS_LEN],
 
 /*
  * Simple trigger command: one nibble per channel position (even position in
- * the high nibble), 0x8 = enabled, low 3 bits = trigger code, 0x7 = none.
- * Hardware triggers are not used: every captured channel is "enabled, no
- * trigger" and triggering is done in software.
+ * the high nibble). DL32_TRIG_ENABLE marks a captured channel, the low three
+ * bits hold its trigger condition (DL32_TRIG_NONE = don't care).
+ * codes[] has one entry per channel; 0 means the channel is not captured.
  */
 SR_PRIV void dl32_build_trigger(uint8_t out[DL32_TRIGGER_LEN],
-	unsigned int num_channels, unsigned int ch_offset)
+	const uint8_t *codes, unsigned int num_channels, unsigned int ch_offset)
 {
 	unsigned int ch, pos;
+	uint8_t nib;
 
 	memset(out, 0, DL32_TRIGGER_LEN);
 	for (ch = 0; ch < num_channels; ch++) {
 		pos = ch_offset + ch;
 		if (pos >= DL32_TRIGGER_POSITIONS)
 			break;
-		out[pos / 2] |= (pos & 1) ? 0x0f : 0xf0;
+		nib = codes[ch] & 0x0f;
+		out[pos / 2] |= (pos & 1) ? nib : (uint8_t)(nib << 4);
 	}
 	/* out[16], out[17]: collect type flags, both 0 for a normal run. */
+}
+
+/*
+ * Translate a sigrok trigger into per-channel hardware codes. The device
+ * supports one condition per channel, all of which must hold at once, so
+ * only single-stage triggers with at most one match per channel fit.
+ * Returns SR_OK and fills codes[] (condition only, no enable bit), or
+ * SR_ERR_NA if the trigger needs the software fallback.
+ */
+SR_PRIV int dl32_trigger_codes(const struct sr_trigger *trigger,
+	unsigned int num_channels, uint8_t *codes)
+{
+	const struct sr_trigger_stage *stage;
+	const struct sr_trigger_match *match;
+	const GSList *l;
+	unsigned int ch;
+	uint8_t code;
+
+	for (ch = 0; ch < num_channels; ch++)
+		codes[ch] = DL32_TRIG_NONE;
+	if (!trigger || !trigger->stages)
+		return SR_OK;
+	if (g_slist_length(trigger->stages) != 1)
+		return SR_ERR_NA;
+
+	stage = trigger->stages->data;
+	for (l = stage->matches; l; l = l->next) {
+		match = l->data;
+		if (!match->channel || !match->channel->enabled)
+			continue;
+		ch = match->channel->index;
+		if (ch >= num_channels || codes[ch] != DL32_TRIG_NONE)
+			return SR_ERR_NA;
+		switch (match->match) {
+		case SR_TRIGGER_ZERO:	 code = DL32_TRIG_LOW; break;
+		case SR_TRIGGER_ONE:	 code = DL32_TRIG_HIGH; break;
+		case SR_TRIGGER_RISING:	 code = DL32_TRIG_RISING; break;
+		case SR_TRIGGER_FALLING: code = DL32_TRIG_FALLING; break;
+		case SR_TRIGGER_EDGE:	 code = DL32_TRIG_EDGE; break;
+		default:
+			return SR_ERR_NA;
+		}
+		codes[ch] = code;
+	}
+
+	return SR_OK;
 }
 
 /* Reply to raw 0x81: [0A][81][01][mode][mcu_hi][mcu_lo][variant][?][plus]. */
@@ -231,6 +284,317 @@ SR_PRIV void dl32_deinterleave(const uint8_t *group, unsigned int num_channels,
 				out[k * unitsize + j] = (acc[j] >> (8 * k)) & 0xff;
 		}
 		out += 8 * unitsize;
+	}
+}
+
+/*
+ * --- Framed device data (status, buffer mode, RLE).
+ *
+ * Layout and meaning follow the DL16 code in ATK-Logic (pv/data/analysis.cpp,
+ * pv/thread/thread_work.cpp): [0A][type][len16 LE][payload][00][0B], with
+ * zero padding allowed between frames.
+ */
+
+static uint64_t read_le40(const uint8_t *p)
+{
+	uint64_t v;
+	int i;
+
+	v = 0;
+	for (i = 4; i >= 0; i--)
+		v = (v << 8) | p[i];
+
+	return v;
+}
+
+SR_PRIV enum dl32_parse_result dl32_parse_frame(const uint8_t *buf,
+	size_t len, size_t *skip, struct dl32_frame *frame)
+{
+	size_t i, plen;
+
+	for (i = 0; i < len; i++) {
+		if (buf[i] != 0x0a)
+			continue;
+		if (i + 1 >= len) {
+			*skip = i;
+			return DL32_PARSE_NEED_MORE;
+		}
+		if (buf[i + 1] < DL32_FRAME_DATA || buf[i + 1] > DL32_FRAME_DONE)
+			continue;
+		if (i + 4 > len) {
+			*skip = i;
+			return DL32_PARSE_NEED_MORE;
+		}
+		plen = buf[i + 2] | (buf[i + 3] << 8);
+		if (i + plen + 6 > len) {
+			*skip = i;
+			return DL32_PARSE_NEED_MORE;
+		}
+		if (buf[i + 4 + plen] != 0x00 || buf[i + 5 + plen] != 0x0b)
+			continue;
+		*skip = i;
+		frame->type = buf[i + 1];
+		frame->payload = &buf[i + 4];
+		frame->len = plen;
+		return DL32_PARSE_FRAME;
+	}
+	*skip = len;
+
+	return DL32_PARSE_NONE;
+}
+
+SR_PRIV struct dl32_capture *dl32_capture_new(gboolean rle)
+{
+	struct dl32_capture *cap;
+
+	cap = g_malloc0(sizeof(*cap));
+	cap->rle = rle;
+
+	return cap;
+}
+
+SR_PRIV void dl32_capture_free(struct dl32_capture *cap)
+{
+	unsigned int i;
+
+	if (!cap)
+		return;
+	for (i = 0; i < DL32_TRIGGER_POSITIONS; i++) {
+		if (cap->chan[i])
+			g_byte_array_free(cap->chan[i], TRUE);
+	}
+	g_free(cap);
+}
+
+/* Returns the frame type that was handled. */
+SR_PRIV int dl32_capture_feed(struct dl32_capture *cap,
+	const struct dl32_frame *frame)
+{
+	const uint8_t *p, *data;
+	size_t n, rest, i, k;
+	unsigned int id;
+	uint8_t run[256];
+
+	p = frame->payload;
+	n = frame->len;
+
+	switch (frame->type) {
+	case DL32_FRAME_DATA:
+		/* [channel id][?][samples...], 8 samples per byte, LSB first. */
+		if (n < 2)
+			break;
+		id = p[0];
+		if (id >= DL32_TRIGGER_POSITIONS) {
+			sr_dbg("Data for unknown channel id %u.", id);
+			break;
+		}
+		if (!cap->chan[id])
+			cap->chan[id] = g_byte_array_new();
+		data = p + 2;
+		rest = n - 2;
+		if (!cap->rle) {
+			g_byte_array_append(cap->chan[id], data, rest);
+		} else {
+			/* (count, value) pairs: count copies of the value byte. */
+			for (i = 0; i + 1 < rest; i += 2) {
+				memset(run, data[i + 1], data[i]);
+				g_byte_array_append(cap->chan[id], run, data[i]);
+			}
+		}
+		cap->frames++;
+		break;
+	case DL32_FRAME_OFFSET:
+		/*
+		 * [2 bytes][trigger offset, 5 bytes][per-channel byte totals,
+		 * 5 bytes each][RLE only: flags, bit 0 over capacity,
+		 * bit 1 over bandwidth].
+		 */
+		if (n < 7)
+			break;
+		cap->have_offset = TRUE;
+		cap->trigger_offset = read_le40(p + 2);
+		rest = n - 7;
+		if (cap->rle && rest % 5 == 1) {
+			cap->exceed_capacity = p[n - 1] & 1;
+			cap->exceed_bandwidth = (p[n - 1] >> 1) & 1;
+			rest--;
+		}
+		cap->num_totals = MIN(rest / 5, DL32_TRIGGER_POSITIONS);
+		for (k = 0; k < cap->num_totals; k++)
+			cap->totals[k] = read_le40(p + 7 + 5 * k);
+		sr_dbg("Trigger offset %" PRIu64 ", %u channel totals%s%s.",
+			cap->trigger_offset, cap->num_totals,
+			cap->exceed_capacity ? ", over capacity" : "",
+			cap->exceed_bandwidth ? ", over bandwidth" : "");
+		break;
+	case DL32_FRAME_ACK:
+		/* [2 bytes][command][result]; a start (0x12) should report 3. */
+		if (n < 3)
+			break;
+		sr_dbg("Ack for command 0x%02x: 0x%02x.", p[2], n > 3 ? p[3] : 0);
+		if (p[2] == DL32_CMD_TRIGGER && n > 3 && p[3] != 3) {
+			sr_warn("Device rejected the capture parameters (code %u).",
+				p[3]);
+			cap->ack_error = TRUE;
+		}
+		if (p[2] == DL32_CMD_STOP)
+			cap->done = TRUE;
+		break;
+	case DL32_FRAME_PROGRESS:
+		if (n >= 7)
+			cap->progress = read_le40(p + 2);
+		break;
+	case DL32_FRAME_DONE:
+		cap->done = TRUE;
+		if (n >= 3 && p[2] == 1) {
+			sr_warn("Device reported a stream overflow.");
+			cap->exceed_capacity = TRUE;
+		}
+		break;
+	default:
+		break;
+	}
+
+	return frame->type;
+}
+
+static void log_frame(const struct dl32_frame *f)
+{
+	GString *s;
+
+	if (f->type == DL32_FRAME_DATA || sr_log_loglevel_get() < SR_LOG_DBG)
+		return;
+	s = sr_hexdump_new(f->payload, MIN(f->len, 24));
+	sr_dbg("Frame type %u, %zu bytes: %s", f->type, f->len, s->str);
+	sr_hexdump_free(s);
+}
+
+/*
+ * Parse all complete frames in buf into cap. Returns how many bytes were
+ * consumed; the rest (a partial frame) must be kept for the next call.
+ */
+SR_PRIV size_t dl32_consume_frames(struct dl32_capture *cap,
+	const uint8_t *buf, size_t len)
+{
+	struct dl32_frame frame;
+	size_t pos, skip;
+	enum dl32_parse_result r;
+
+	pos = 0;
+	while (pos < len) {
+		r = dl32_parse_frame(buf + pos, len - pos, &skip, &frame);
+		if (r != DL32_PARSE_FRAME) {
+			pos += skip;
+			break;
+		}
+		log_frame(&frame);
+		dl32_capture_feed(cap, &frame);
+		pos += skip + frame.len + 6;
+	}
+
+	return pos;
+}
+
+/*
+ * Work out which device channel feeds each sigrok channel and where the
+ * requested window starts, mirroring ATK-Logic's DL16 trimming: the device
+ * may send more data than asked for, and the trigger offset plus per-channel
+ * totals tell where the pre-trigger window begins.
+ */
+SR_PRIV void dl32_capture_plan(const struct dl32_capture *cap,
+	unsigned int num_channels, unsigned int ch_offset,
+	uint32_t enabled_mask, gboolean buffer_mode, uint64_t depth,
+	uint64_t pre_trigger, struct dl32_plan *plan)
+{
+	unsigned int ch, id, shift, tidx;
+	uint64_t t, min_total, avail, count;
+	gboolean any;
+
+	/* Device ids are either 0-based or include the channel offset. */
+	shift = 0;
+	for (id = num_channels; id < DL32_TRIGGER_POSITIONS; id++) {
+		if (cap->chan[id]) {
+			shift = ch_offset;
+			break;
+		}
+	}
+
+	min_total = UINT64_MAX;
+	for (ch = 0; ch < num_channels; ch++) {
+		id = ch + shift;
+		plan->src[ch] = -1;
+		plan->start[ch] = 0;
+		if (!(enabled_mask & (1u << ch)) || id >= DL32_TRIGGER_POSITIONS ||
+				!cap->chan[id])
+			continue;
+		plan->src[ch] = id;
+
+		if (!buffer_mode || !cap->have_offset)
+			continue;
+		tidx = (cap->num_totals > num_channels &&
+			cap->num_totals >= ch_offset + num_channels) ?
+			ch + ch_offset : ch;
+		t = tidx < cap->num_totals ? cap->totals[tidx] : 0;
+		if (t && t * 8 > depth && t * 8 > pre_trigger + cap->trigger_offset)
+			plan->start[ch] = t * 8 - pre_trigger - cap->trigger_offset;
+		if (t && t < min_total)
+			min_total = t;
+	}
+
+	/* Over capacity (RLE): align all channels to the shortest one. */
+	if (buffer_mode && cap->rle && cap->exceed_capacity &&
+			min_total != UINT64_MAX) {
+		for (ch = 0; ch < num_channels; ch++) {
+			if (plan->src[ch] < 0)
+				continue;
+			tidx = (cap->num_totals > num_channels &&
+				cap->num_totals >= ch_offset + num_channels) ?
+				ch + ch_offset : ch;
+			t = tidx < cap->num_totals ? cap->totals[tidx] : 0;
+			plan->start[ch] = t ? (t - min_total) * 8 : 0;
+		}
+	}
+
+	/* Output as many samples as every captured channel can provide. */
+	any = FALSE;
+	count = UINT64_MAX;
+	for (ch = 0; ch < num_channels; ch++) {
+		if (plan->src[ch] < 0)
+			continue;
+		avail = (uint64_t)cap->chan[plan->src[ch]]->len * 8;
+		avail = avail > plan->start[ch] ? avail - plan->start[ch] : 0;
+		count = MIN(count, avail);
+		any = TRUE;
+	}
+	if (!any)
+		count = 0;
+	if (depth)
+		count = MIN(count, depth);
+	plan->count = count;
+}
+
+/* Interleave n output samples starting at sample 'first' of the window. */
+SR_PRIV void dl32_capture_render(const struct dl32_capture *cap,
+	const struct dl32_plan *plan, unsigned int num_channels,
+	uint64_t first, uint64_t n, uint8_t *out)
+{
+	unsigned int unitsize, ch;
+	const uint8_t *src;
+	uint64_t s, bit;
+	uint8_t mask;
+
+	unitsize = num_channels / 8;
+	memset(out, 0, n * unitsize);
+	for (ch = 0; ch < num_channels; ch++) {
+		if (plan->src[ch] < 0)
+			continue;
+		src = cap->chan[plan->src[ch]]->data;
+		mask = 1 << (ch % 8);
+		bit = plan->start[ch] + first;
+		for (s = 0; s < n; s++, bit++) {
+			if (src[bit >> 3] & (1 << (bit & 7)))
+				out[s * unitsize + ch / 8] |= mask;
+		}
 	}
 }
 
@@ -358,7 +722,129 @@ SR_PRIV void dl32_send_stop(libusb_device_handle *hdl)
 	usb_drain(hdl);
 }
 
+
 /* --- Asynchronous acquisition. */
+
+static void send_logic(const struct sr_dev_inst *sdi, uint8_t *data,
+	uint64_t num_samples)
+{
+	struct dev_context *devc;
+	struct sr_datafeed_packet packet;
+	struct sr_datafeed_logic logic;
+
+	devc = sdi->priv;
+	if (!num_samples)
+		return;
+
+	logic.length = num_samples * devc->unitsize;
+	logic.unitsize = devc->unitsize;
+	logic.data = data;
+	packet.type = SR_DF_LOGIC;
+	packet.payload = &logic;
+	sr_session_send(sdi, &packet);
+}
+
+static void send_trigger_marker(const struct sr_dev_inst *sdi)
+{
+	struct sr_datafeed_packet packet;
+
+	packet.type = SR_DF_TRIGGER;
+	packet.payload = NULL;
+	sr_session_send(sdi, &packet);
+}
+
+/*
+ * Send samples to the session, honouring the software trigger, the sample
+ * limit and the hardware trigger position (marker_pos, in output samples).
+ */
+static void process_samples(const struct sr_dev_inst *sdi, uint8_t *buf,
+	uint64_t num_samples)
+{
+	struct dev_context *devc;
+	uint64_t n, before, marker;
+	int trigger_offset, pre_trigger_samples;
+
+	devc = sdi->priv;
+
+	if (!devc->trigger_fired) {
+		trigger_offset = soft_trigger_logic_check(devc->stl, buf,
+			num_samples * devc->unitsize, &pre_trigger_samples);
+		if (trigger_offset < 0)
+			return;
+		/* Pre-trigger samples and the marker were sent by the checker. */
+		devc->trigger_fired = TRUE;
+		devc->sent_samples += pre_trigger_samples;
+		buf += trigger_offset * devc->unitsize;
+		num_samples -= trigger_offset;
+	}
+
+	n = num_samples;
+	if (devc->acq_limit && devc->sent_samples + n > devc->acq_limit)
+		n = devc->acq_limit - devc->sent_samples;
+
+	/*
+	 * Hardware trigger position: in buffer mode the window is trimmed so
+	 * the trigger sits at the pre-trigger point; in stream mode the device
+	 * reports where it fired (as ATK-Logic shows it).
+	 */
+	marker = UINT64_MAX;
+	if (devc->hw_trigger && !devc->marker_sent && devc->capture &&
+			devc->capture->have_offset)
+		marker = devc->buffer_mode ? devc->pre_trigger :
+			devc->capture->trigger_offset;
+	if (marker >= devc->sent_samples && marker < devc->sent_samples + n) {
+		before = marker - devc->sent_samples;
+		send_logic(sdi, buf, before);
+		send_trigger_marker(sdi);
+		send_logic(sdi, buf + before * devc->unitsize, n - before);
+		devc->marker_sent = TRUE;
+	} else {
+		send_logic(sdi, buf, n);
+	}
+	devc->sent_samples += n;
+}
+
+/* Turn the collected buffer-mode / RLE data into session packets. */
+static void flush_capture(const struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc;
+	struct dl32_plan plan;
+	uint64_t pos, n;
+	const uint64_t chunk = 64 * 1024;
+	uint8_t *buf;
+	unsigned int ch;
+
+	devc = sdi->priv;
+	if (!devc->capture)
+		return;
+
+	dl32_capture_plan(devc->capture, devc->num_channels, devc->ch_offset,
+		devc->enabled_mask, devc->buffer_mode, devc->acq_limit,
+		devc->pre_trigger, &plan);
+	for (ch = 0; ch < devc->num_channels; ch++) {
+		if (plan.src[ch] >= 0)
+			sr_dbg("D%u: device id %d, %u bytes, start %" PRIu64 ".",
+				ch, plan.src[ch],
+				devc->capture->chan[plan.src[ch]]->len,
+				plan.start[ch]);
+	}
+	sr_dbg("Sending %" PRIu64 " collected samples (%" PRIu64
+		" data frames).", plan.count, devc->capture->frames);
+	if (!plan.count) {
+		if (devc->capture->frames)
+			sr_err("Collected data does not cover the requested window.");
+		return;
+	}
+
+	buf = g_malloc(chunk * devc->unitsize);
+	for (pos = 0; pos < plan.count; pos += n) {
+		n = MIN(chunk, plan.count - pos);
+		dl32_capture_render(devc->capture, &plan, devc->num_channels,
+			pos, n, buf);
+		process_samples(sdi, buf, n);
+	}
+	g_free(buf);
+}
 
 static void finish_acquisition(struct sr_dev_inst *sdi)
 {
@@ -371,6 +857,9 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
 	usb_source_remove(sdi->session, devc->ctx);
 	dl32_send_stop(usb->devhdl);
 
+	if (devc->framed)
+		flush_capture(sdi);
+
 	if (devc->frame_begun)
 		std_session_send_df_frame_end(sdi);
 	std_session_send_df_end(sdi);
@@ -382,6 +871,16 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
 	devc->group_buf = NULL;
 	g_free(devc->conv_buf);
 	devc->conv_buf = NULL;
+	if (devc->pending) {
+		g_byte_array_free(devc->pending, TRUE);
+		devc->pending = NULL;
+	}
+	dl32_capture_free(devc->capture);
+	devc->capture = NULL;
+	if (devc->dump) {
+		fclose(devc->dump);
+		devc->dump = NULL;
+	}
 	if (devc->stl) {
 		soft_trigger_logic_free(devc->stl);
 		devc->stl = NULL;
@@ -436,61 +935,69 @@ SR_PRIV void dl32_abort_acquisition(struct dev_context *devc)
 	}
 }
 
-static void send_logic(const struct sr_dev_inst *sdi, uint8_t *data,
-	uint64_t num_samples)
+/* Stream mode: group the raw channel blocks and send them out. */
+static void feed_raw(const struct sr_dev_inst *sdi, const uint8_t *p,
+	size_t left)
 {
 	struct dev_context *devc;
-	struct sr_datafeed_packet packet;
-	struct sr_datafeed_logic logic;
+	size_t take;
 
 	devc = sdi->priv;
-	if (!num_samples)
+	while (left > 0 && !devc->acq_aborted) {
+		take = MIN(left, devc->group_bytes - devc->group_fill);
+		memcpy(devc->group_buf + devc->group_fill, p, take);
+		devc->group_fill += take;
+		p += take;
+		left -= take;
+		if (devc->group_fill < devc->group_bytes)
+			break;
+		devc->group_fill = 0;
+
+		dl32_deinterleave(devc->group_buf, devc->num_channels,
+			devc->conv_buf);
+		process_samples(sdi, devc->conv_buf, DL32_BLOCK_SAMPLES);
+
+		if (devc->acq_limit && devc->sent_samples >= devc->acq_limit) {
+			dl32_abort_acquisition(devc);
+			break;
+		}
+	}
+}
+
+/* Buffer / RLE mode: collect frames until the device says it is done. */
+static void feed_framed(const struct sr_dev_inst *sdi, const uint8_t *p,
+	size_t len)
+{
+	struct dev_context *devc;
+	size_t used;
+
+	devc = sdi->priv;
+	g_byte_array_append(devc->pending, p, len);
+	used = dl32_consume_frames(devc->capture, devc->pending->data,
+		devc->pending->len);
+	if (used)
+		g_byte_array_remove_range(devc->pending, 0, used);
+
+	if (devc->capture->frames)
+		devc->data_started = TRUE;
+
+	/*
+	 * If lots of data arrives but none of it is framed, the device sends
+	 * raw channel blocks like in stream mode. Switch to that format.
+	 */
+	if (!devc->capture->frames && !devc->capture->done &&
+			devc->pending->len > 4 * devc->group_bytes) {
+		sr_warn("No data frames in %u bytes; treating the data as raw "
+			"channel blocks.", devc->pending->len);
+		devc->framed = FALSE;
+		devc->data_started = TRUE;
+		feed_raw(sdi, devc->pending->data, devc->pending->len);
+		g_byte_array_set_size(devc->pending, 0);
 		return;
-
-	logic.length = num_samples * devc->unitsize;
-	logic.unitsize = devc->unitsize;
-	logic.data = data;
-	packet.type = SR_DF_LOGIC;
-	packet.payload = &logic;
-	sr_session_send(sdi, &packet);
-}
-
-/* Feed one de-interleaved group into the session, honouring trigger/limit. */
-static void process_samples(const struct sr_dev_inst *sdi, uint8_t *buf,
-	uint64_t num_samples)
-{
-	struct dev_context *devc;
-	uint64_t n;
-	int trigger_offset, pre_trigger_samples;
-
-	devc = sdi->priv;
-
-	if (!devc->trigger_fired) {
-		trigger_offset = soft_trigger_logic_check(devc->stl, buf,
-			num_samples * devc->unitsize, &pre_trigger_samples);
-		if (trigger_offset < 0)
-			return;
-		/* Pre-trigger samples were already sent by the checker. */
-		devc->trigger_fired = TRUE;
-		devc->sent_samples += pre_trigger_samples;
-		buf += trigger_offset * devc->unitsize;
-		num_samples -= trigger_offset;
 	}
 
-	n = num_samples;
-	if (devc->acq_limit && devc->sent_samples + n > devc->acq_limit)
-		n = devc->acq_limit - devc->sent_samples;
-	send_logic(sdi, buf, n);
-	devc->sent_samples += n;
-}
-
-static void handle_status(const uint8_t *buf, int len)
-{
-	if (sr_log_loglevel_get() >= SR_LOG_DBG) {
-		GString *s = sr_hexdump_new(buf, MIN(len, 24));
-		sr_dbg("Status packet type 0x%02x: %s", buf[1], s->str);
-		sr_hexdump_free(s);
-	}
+	if (devc->capture->ack_error || devc->capture->done)
+		dl32_abort_acquisition(devc);
 }
 
 static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
@@ -498,7 +1005,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	struct sr_dev_inst *sdi;
 	struct dev_context *devc;
 	const uint8_t *p;
-	size_t left, take;
+	size_t len;
 
 	sdi = transfer->user_data;
 	devc = sdi->priv;
@@ -525,7 +1032,9 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	}
 
 	if (transfer->actual_length <= 0) {
-		if (++devc->empty_transfer_count > DL32_MAX_EMPTY_XFERS) {
+		/* Waiting for a trigger or a buffer capture is not an error. */
+		if (devc->data_started &&
+				++devc->empty_transfer_count > DL32_MAX_EMPTY_XFERS) {
 			sr_err("Device stopped sending data.");
 			dl32_abort_acquisition(devc);
 			free_transfer(transfer);
@@ -537,36 +1046,21 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	devc->empty_transfer_count = 0;
 
 	p = transfer->buffer;
-	left = transfer->actual_length;
+	len = transfer->actual_length;
+	if (devc->dump)
+		fwrite(p, 1, len, devc->dump);
 
-	/* Status packets ([0A][type]...) arrive as their own short reads. */
-	if (!devc->data_started) {
-		if (p[0] == 0x0a && left < DL32_STATUS_MAX_LEN) {
-			handle_status(p, left);
-			resubmit_transfer(transfer);
-			return;
-		}
-		devc->data_started = TRUE;
-	}
-
-	while (left > 0 && !devc->acq_aborted) {
-		take = MIN(left, devc->group_bytes - devc->group_fill);
-		memcpy(devc->group_buf + devc->group_fill, p, take);
-		devc->group_fill += take;
-		p += take;
-		left -= take;
-		if (devc->group_fill < devc->group_bytes)
-			break;
-		devc->group_fill = 0;
-
-		dl32_deinterleave(devc->group_buf, devc->num_channels,
-			devc->conv_buf);
-		process_samples(sdi, devc->conv_buf, DL32_BLOCK_SAMPLES);
-
-		if (devc->acq_limit && devc->sent_samples >= devc->acq_limit) {
+	if (devc->framed) {
+		feed_framed(sdi, p, len);
+	} else if (!devc->data_started && p[0] == 0x0a &&
+			len < DL32_STATUS_MAX_LEN) {
+		/* Status frames arrive as their own short reads. */
+		dl32_consume_frames(devc->capture, p, len);
+		if (devc->capture->ack_error)
 			dl32_abort_acquisition(devc);
-			break;
-		}
+	} else {
+		devc->data_started = TRUE;
+		feed_raw(sdi, p, len);
 	}
 
 	if (devc->acq_aborted)
@@ -598,18 +1092,47 @@ static int receive_data(int fd, int revents, void *cb_data)
 	return TRUE;
 }
 
+static void reset_acquisition_state(struct dev_context *devc)
+{
+	g_free(devc->transfers);
+	devc->transfers = NULL;
+	devc->num_transfers = 0;
+	if (devc->stl) {
+		soft_trigger_logic_free(devc->stl);
+		devc->stl = NULL;
+	}
+	g_free(devc->group_buf);
+	devc->group_buf = NULL;
+	g_free(devc->conv_buf);
+	devc->conv_buf = NULL;
+	if (devc->pending) {
+		g_byte_array_free(devc->pending, TRUE);
+		devc->pending = NULL;
+	}
+	dl32_capture_free(devc->capture);
+	devc->capture = NULL;
+	if (devc->dump) {
+		fclose(devc->dump);
+		devc->dump = NULL;
+	}
+}
+
 SR_PRIV int dl32_start_acquisition(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc;
 	struct sr_usb_dev_inst *usb;
 	struct sr_trigger *trigger;
 	struct libusb_transfer *transfer;
+	struct sr_channel *ch;
+	const GSList *l;
 	uint8_t params[DL32_PARAMS_LEN], trig[DL32_TRIGGER_LEN];
+	uint8_t codes[DL32_TRIGGER_POSITIONS];
 	uint8_t one = 1, reply[512];
-	uint64_t limit, device_samples, groups;
+	uint64_t limit, device_samples, trigger_pos, groups;
+	const char *dump_path;
 	size_t xfer_size;
 	unsigned int i;
-	int hz_index, pre_trigger, ret;
+	int hz_index, ret;
 
 	devc = sdi->priv;
 	usb = sdi->conn;
@@ -628,53 +1151,110 @@ SR_PRIV int dl32_start_acquisition(const struct sr_dev_inst *sdi)
 	}
 	devc->acq_limit = limit;
 
-	/*
-	 * The device streams a fixed number of samples. Round up to whole
-	 * groups; for continuous mode ask for an hour (or the 40 bit max).
-	 * With a software trigger the trigger point is unknown, so keep
-	 * streaming until the post-trigger limit is reached or stopped.
-	 */
+	devc->buffer_mode = !devc->stream_mode ||
+		devc->samplerate > DL32_MAX_STREAM_RATE;
+	if (devc->buffer_mode && !limit) {
+		sr_err("Buffer mode (rates above 100 MHz or continuous=0) "
+			"needs a sample or time limit.");
+		return SR_ERR_ARG;
+	}
+	devc->framed = devc->buffer_mode || devc->rle;
+
+	/* Captured channels. Stream mode without RLE always sends all of them. */
+	devc->enabled_mask = 0;
+	for (l = sdi->channels; l; l = l->next) {
+		ch = l->data;
+		if (ch->enabled && ch->index < (int)devc->num_channels)
+			devc->enabled_mask |= 1u << ch->index;
+	}
+	if (!devc->framed || !devc->enabled_mask)
+		devc->enabled_mask = (devc->num_channels == 32) ?
+			0xffffffff : (1u << devc->num_channels) - 1;
+
+	/* Hardware trigger when the device can express it, else software. */
 	trigger = sr_session_trigger_get(sdi->session);
-	if (limit && !trigger)
+	devc->hw_trigger = FALSE;
+	devc->stl = NULL;
+	devc->trigger_fired = TRUE;
+	if (dl32_trigger_codes(trigger, devc->num_channels, codes) == SR_OK) {
+		devc->hw_trigger = trigger != NULL;
+	} else {
+		sr_info("Trigger needs more than one stage or condition per "
+			"channel; using a software trigger.");
+		for (i = 0; i < devc->num_channels; i++)
+			codes[i] = DL32_TRIG_NONE;
+	}
+	for (i = 0; i < devc->num_channels; i++) {
+		if (codes[i] != DL32_TRIG_NONE)
+			devc->enabled_mask |= 1u << i;
+		codes[i] = (devc->enabled_mask & (1u << i)) ?
+			(codes[i] | DL32_TRIG_ENABLE) : 0;
+	}
+
+	/* Samples requested from the device, and the pre-trigger position. */
+	trigger_pos = limit ? (limit / 100) * devc->capture_ratio : 0;
+	if (devc->buffer_mode) {
 		device_samples = limit;
-	else
-		device_samples = MIN(devc->samplerate * 3600,
-			DL32_MAX_DEVICE_SAMPLES);
-	groups = (device_samples + DL32_BLOCK_SAMPLES - 1) / DL32_BLOCK_SAMPLES;
-	device_samples = MIN(groups * DL32_BLOCK_SAMPLES, DL32_MAX_DEVICE_SAMPLES);
+	} else if (limit && !(trigger && !devc->hw_trigger)) {
+		/* Whole groups; the extra samples are dropped. */
+		groups = (limit + DL32_BLOCK_SAMPLES - 1) / DL32_BLOCK_SAMPLES;
+		device_samples = groups * DL32_BLOCK_SAMPLES;
+	} else {
+		/* Continuous, or a software trigger at an unknown point. */
+		device_samples = devc->samplerate * 3600;
+	}
+	device_samples = MIN(device_samples, DL32_MAX_DEVICE_SAMPLES);
+	devc->pre_trigger = trigger_pos;
+	devc->marker_sent = FALSE;
 
 	devc->unitsize = devc->num_channels / 8;
 	devc->group_bytes = (size_t)devc->num_channels * DL32_BLOCK_BYTES;
 	devc->group_fill = 0;
 	devc->group_buf = g_malloc(devc->group_bytes);
 	devc->conv_buf = g_malloc((size_t)DL32_BLOCK_SAMPLES * devc->unitsize);
+	devc->pending = g_byte_array_new();
+	devc->capture = dl32_capture_new(devc->rle);
 	devc->sent_samples = 0;
 	devc->empty_transfer_count = 0;
 	devc->acq_aborted = FALSE;
 	devc->acq_done = FALSE;
 	devc->data_started = FALSE;
 	devc->frame_begun = FALSE;
-	devc->ctx = sdi->driver->context ?
-		((struct drv_context *)sdi->driver->context)->sr_ctx : NULL;
+	devc->ctx = ((struct drv_context *)sdi->driver->context)->sr_ctx;
 
-	if (trigger) {
-		pre_trigger = limit ? (devc->capture_ratio * limit) / 100 : 0;
-		devc->stl = soft_trigger_logic_new(sdi, trigger, pre_trigger);
+	if (trigger && !devc->hw_trigger) {
+		devc->stl = soft_trigger_logic_new(sdi, trigger,
+			limit ? (devc->capture_ratio * limit) / 100 : 0);
 		if (!devc->stl)
 			goto err_free;
 		devc->trigger_fired = FALSE;
-	} else {
-		devc->trigger_fired = TRUE;
 	}
 
-	dl32_build_params(params, FALSE, FALSE,
-		threshold_tenths[devc->threshold_idx], hz_index,
-		device_samples, 0);
-	dl32_build_trigger(trig, devc->num_channels, devc->ch_offset);
+	/* Diagnostics: ALIENTEK_DL32_DUMP=<file> saves everything received. */
+	dump_path = g_getenv("ALIENTEK_DL32_DUMP");
+	devc->dump = dump_path ? fopen(dump_path, "wb") : NULL;
+	if (dump_path && !devc->dump)
+		sr_warn("Cannot open dump file %s.", dump_path);
 
-	sr_dbg("Starting: %" PRIu64 " Hz, %u channels, %" PRIu64
-		" device samples, limit %" PRIu64 ".", devc->samplerate,
-		devc->num_channels, device_samples, limit);
+	dl32_build_params(params, devc->buffer_mode, devc->rle,
+		threshold_tenths[devc->threshold_idx], hz_index,
+		device_samples, trigger_pos);
+	dl32_build_trigger(trig, codes, devc->num_channels, devc->ch_offset);
+
+	if (sr_log_loglevel_get() >= SR_LOG_DBG) {
+		GString *ps = sr_hexdump_new(params, sizeof(params));
+		GString *ts = sr_hexdump_new(trig, sizeof(trig));
+		sr_dbg("Starting %s mode%s: %" PRIu64 " Hz, %" PRIu64
+			" device samples, limit %" PRIu64 ", %s trigger.",
+			devc->buffer_mode ? "buffer" : "stream",
+			devc->rle ? " (RLE)" : "", devc->samplerate,
+			device_samples, limit, devc->hw_trigger ? "hardware" :
+			devc->stl ? "software" : "no");
+		sr_dbg("Params: %s", ps->str);
+		sr_dbg("Trigger: %s", ts->str);
+		sr_hexdump_free(ps);
+		sr_hexdump_free(ts);
+	}
 
 	/* Wake the FPGA, then send parameters and the start (trigger) command. */
 	usb_drain(usb->devhdl);
@@ -709,9 +1289,15 @@ SR_PRIV int dl32_start_acquisition(const struct sr_dev_inst *sdi)
 	std_session_send_df_frame_begin(sdi);
 	devc->frame_begun = TRUE;
 
-	if (send_framed(usb->devhdl, DL32_CMD_PARAMS, params, sizeof(params)) != SR_OK ||
-	    send_framed(usb->devhdl, DL32_CMD_TRIGGER, trig, sizeof(trig)) != SR_OK) {
-		sr_err("Failed to send start commands.");
+	if (send_framed(usb->devhdl, DL32_CMD_PARAMS, params, sizeof(params)) != SR_OK) {
+		sr_err("Failed to send capture parameters.");
+		dl32_abort_acquisition(devc);
+		return SR_OK;
+	}
+	/* ATK-Logic waits between the two commands so the FPGA can settle. */
+	g_usleep(30 * 1000);
+	if (send_framed(usb->devhdl, DL32_CMD_TRIGGER, trig, sizeof(trig)) != SR_OK) {
+		sr_err("Failed to send the start command.");
 		dl32_abort_acquisition(devc);
 	}
 
@@ -729,18 +1315,8 @@ err_cancel:
 		libusb_handle_events_timeout_completed(devc->ctx->libusb_ctx,
 			&tv, NULL);
 	}
-	g_free(devc->transfers);
-	devc->transfers = NULL;
-	devc->num_transfers = 0;
 err_free:
-	if (devc->stl) {
-		soft_trigger_logic_free(devc->stl);
-		devc->stl = NULL;
-	}
-	g_free(devc->group_buf);
-	devc->group_buf = NULL;
-	g_free(devc->conv_buf);
-	devc->conv_buf = NULL;
+	reset_acquisition_state(devc);
 
 	return SR_ERR;
 }

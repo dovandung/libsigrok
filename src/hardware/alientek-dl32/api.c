@@ -40,7 +40,8 @@ static const uint32_t drvopts[] = {
 };
 
 static const uint32_t devopts[] = {
-	SR_CONF_CONTINUOUS,
+	SR_CONF_CONTINUOUS | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_RLE | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_CONN | SR_CONF_GET,
 	SR_CONF_SAMPLERATE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_LIMIT_SAMPLES | SR_CONF_GET | SR_CONF_SET,
@@ -164,6 +165,8 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		devc->limit_samples = SR_MHZ(1);
 		devc->capture_ratio = 10;
 		devc->threshold_idx = 1; /* 3.3V */
+		devc->stream_mode = TRUE;
+		devc->rle = FALSE;
 		sdi->priv = devc;
 
 		sr_info("Found %s %s at %s.", sdi->vendor, sdi->model,
@@ -247,6 +250,12 @@ static int config_get(uint32_t key, GVariant **data,
 	case SR_CONF_CAPTURE_RATIO:
 		*data = g_variant_new_uint64(devc->capture_ratio);
 		break;
+	case SR_CONF_CONTINUOUS:
+		*data = g_variant_new_boolean(devc->stream_mode);
+		break;
+	case SR_CONF_RLE:
+		*data = g_variant_new_boolean(devc->rle);
+		break;
 	default:
 		return SR_ERR_NA;
 	}
@@ -283,6 +292,13 @@ static int config_set(uint32_t key, GVariant *data,
 		break;
 	case SR_CONF_CAPTURE_RATIO:
 		devc->capture_ratio = g_variant_get_uint64(data);
+		break;
+	case SR_CONF_CONTINUOUS:
+		/* TRUE: stream to the host. FALSE: capture into device memory. */
+		devc->stream_mode = g_variant_get_boolean(data);
+		break;
+	case SR_CONF_RLE:
+		devc->rle = g_variant_get_boolean(data);
 		break;
 	default:
 		return SR_ERR_NA;
