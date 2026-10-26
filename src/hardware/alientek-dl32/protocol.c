@@ -256,13 +256,12 @@ SR_PRIV void dl32_parse_name(const uint8_t *buf, size_t len,
  * spread[b] puts bit k of b into the lowest bit of byte k, so OR-ing
  * spread[b] << c for 8 channels gives 8 samples of 8 channels at once.
  */
-SR_PRIV void dl32_deinterleave(const uint8_t *group, unsigned int num_channels,
-	uint8_t *out)
+/* spread[b] puts bit k of b into the lowest bit of byte k. */
+static const uint64_t *spread_table(void)
 {
 	static uint64_t spread[256];
 	static gboolean spread_ready;
-	unsigned int unitsize, i, c, j, k;
-	uint64_t acc[4];
+	unsigned int i, k;
 
 	if (!spread_ready) {
 		for (i = 0; i < 256; i++) {
@@ -273,6 +272,17 @@ SR_PRIV void dl32_deinterleave(const uint8_t *group, unsigned int num_channels,
 		spread_ready = TRUE;
 	}
 
+	return spread;
+}
+
+SR_PRIV void dl32_deinterleave(const uint8_t *group, unsigned int num_channels,
+	uint8_t *out)
+{
+	const uint64_t *spread;
+	unsigned int unitsize, i, c, j, k;
+	uint64_t acc[4];
+
+	spread = spread_table();
 	unitsize = num_channels / 8;
 	for (i = 0; i < DL32_BLOCK_BYTES; i++) {
 		for (j = 0; j < unitsize; j++) {
@@ -410,7 +420,6 @@ SR_PRIV int dl32_capture_feed(struct dl32_capture *cap,
 	const uint8_t *p, *data;
 	size_t n, rest, i, k;
 	unsigned int id;
-	uint8_t run[256];
 
 	p = frame->payload;
 	n = frame->len;
@@ -433,9 +442,14 @@ SR_PRIV int dl32_capture_feed(struct dl32_capture *cap,
 			g_byte_array_append(cap->chan[id], data, rest);
 		} else {
 			/* (count, value) pairs: count copies of the value byte. */
+			size_t total = 0, at;
+			for (i = 0; i + 1 < rest; i += 2)
+				total += data[i];
+			at = cap->chan[id]->len;
+			g_byte_array_set_size(cap->chan[id], at + total);
 			for (i = 0; i + 1 < rest; i += 2) {
-				memset(run, data[i + 1], data[i]);
-				g_byte_array_append(cap->chan[id], run, data[i]);
+				memset(cap->chan[id]->data + at, data[i + 1], data[i]);
+				at += data[i];
 			}
 		}
 		cap->frames++;
@@ -533,6 +547,40 @@ SR_PRIV size_t dl32_consume_frames(struct dl32_capture *cap,
 }
 
 /*
+ * Add one USB read to the pending bytes and parse what is complete.
+ *
+ * Status frames (including "done") always arrive in their own short read.
+ * If such a read holds a complete frame at its start while bytes are still
+ * pending, those bytes are leftovers that look like an unfinished frame
+ * (seen after RLE data); drop them so the status frame is not stuck
+ * behind them.
+ */
+SR_PRIV void dl32_feed_bytes(struct dl32_capture *cap, GByteArray *pending,
+	const uint8_t *p, size_t len)
+{
+	struct dl32_frame frame;
+	size_t skip, used;
+
+	if (pending->len && len < DL32_STATUS_MAX_LEN && p[0] == 0x0a &&
+			dl32_parse_frame(p, len, &skip, &frame) == DL32_PARSE_FRAME &&
+			skip == 0) {
+		if (sr_log_loglevel_get() >= SR_LOG_DBG) {
+			GString *str = sr_hexdump_new(pending->data,
+				MIN(pending->len, 16));
+			sr_dbg("Dropping %u stale bytes before a status frame: %s",
+				pending->len, str->str);
+			sr_hexdump_free(str);
+		}
+		g_byte_array_set_size(pending, 0);
+	}
+
+	g_byte_array_append(pending, p, len);
+	used = dl32_consume_frames(cap, pending->data, pending->len);
+	if (used)
+		g_byte_array_remove_range(pending, 0, used);
+}
+
+/*
  * Work out which device channel feeds each sigrok channel and where the
  * requested window starts, mirroring ATK-Logic's DL16 trimming: the device
  * may send more data than asked for, and the trigger offset plus per-channel
@@ -622,22 +670,49 @@ SR_PRIV void dl32_capture_render(const struct dl32_capture *cap,
 	const struct dl32_plan *plan, unsigned int num_channels,
 	uint64_t first, uint64_t n, uint8_t *out)
 {
-	unsigned int unitsize, ch;
-	const uint8_t *src;
-	uint64_t s, bit;
-	uint8_t mask;
+	const uint64_t *spread;
+	const uint8_t *src[DL32_TRIGGER_POSITIONS];
+	unsigned int unitsize, ch, j, c, k, b;
+	uint64_t s, bit, q, blocks, acc;
+	uint8_t v;
 
+	spread = spread_table();
 	unitsize = num_channels / 8;
-	memset(out, 0, n * unitsize);
+	for (ch = 0; ch < num_channels; ch++)
+		src[ch] = plan->src[ch] < 0 ? NULL :
+			cap->chan[plan->src[ch]]->data;
+
+	/* Whole blocks of 8 samples: build each output byte lane at once. */
+	blocks = n / 8;
+	for (s = 0; s < blocks; s++) {
+		for (j = 0; j < unitsize; j++) {
+			acc = 0;
+			for (c = 0; c < 8; c++) {
+				ch = j * 8 + c;
+				if (!src[ch])
+					continue;
+				bit = plan->start[ch] + first + s * 8;
+				q = bit >> 3;
+				b = bit & 7;
+				v = src[ch][q] >> b;
+				if (b)
+					v |= src[ch][q + 1] << (8 - b);
+				acc |= spread[v] << c;
+			}
+			for (k = 0; k < 8; k++)
+				out[(s * 8 + k) * unitsize + j] = (acc >> (8 * k)) & 0xff;
+		}
+	}
+
+	/* Remaining samples one at a time. */
+	memset(out + blocks * 8 * unitsize, 0, (n - blocks * 8) * unitsize);
 	for (ch = 0; ch < num_channels; ch++) {
-		if (plan->src[ch] < 0)
+		if (!src[ch])
 			continue;
-		src = cap->chan[plan->src[ch]]->data;
-		mask = 1 << (ch % 8);
-		bit = plan->start[ch] + first;
-		for (s = 0; s < n; s++, bit++) {
-			if (src[bit >> 3] & (1 << (bit & 7)))
-				out[s * unitsize + ch / 8] |= mask;
+		for (s = blocks * 8; s < n; s++) {
+			bit = plan->start[ch] + first + s;
+			if (src[ch][bit >> 3] & (1 << (bit & 7)))
+				out[s * unitsize + ch / 8] |= 1 << (ch % 8);
 		}
 	}
 }
@@ -1077,14 +1152,9 @@ static void feed_framed(const struct sr_dev_inst *sdi, const uint8_t *p,
 	size_t len)
 {
 	struct dev_context *devc;
-	size_t used;
 
 	devc = sdi->priv;
-	g_byte_array_append(devc->pending, p, len);
-	used = dl32_consume_frames(devc->capture, devc->pending->data,
-		devc->pending->len);
-	if (used)
-		g_byte_array_remove_range(devc->pending, 0, used);
+	dl32_feed_bytes(devc->capture, devc->pending, p, len);
 
 	if (devc->capture->frames)
 		devc->data_started = TRUE;

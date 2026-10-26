@@ -224,6 +224,8 @@ SR_PRIV enum dl32_parse_result dl32_parse_frame(const uint8_t *buf,
 	size_t len, size_t *skip, struct dl32_frame *frame);
 SR_PRIV size_t dl32_consume_frames(struct dl32_capture *cap,
 	const uint8_t *buf, size_t len);
+SR_PRIV void dl32_feed_bytes(struct dl32_capture *cap, GByteArray *pending,
+	const uint8_t *p, size_t len);
 SR_PRIV struct dl32_capture *dl32_capture_new(gboolean rle);
 SR_PRIV void dl32_capture_free(struct dl32_capture *cap);
 SR_PRIV int dl32_capture_feed(struct dl32_capture *cap,
