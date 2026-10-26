@@ -83,6 +83,14 @@
 /* The device takes a 40 bit sample count. */
 #define DL32_MAX_DEVICE_SAMPLES	((UINT64_C(1) << 40) - 1)
 
+/*
+ * Buffer mode budget: sample rate x captured channels. 8 G fits the
+ * DL32 Plus (32 ch @ 250 MHz, 16 ch @ 500 MHz, 8 ch @ 1 GHz) and the DL16
+ * Plus figures in ATK-Logic; the non-Plus is assumed to have half.
+ */
+#define DL32_PLUS_BUDGET	(UINT64_C(8000) * SR_MHZ(1))
+#define DL32_BUDGET		(UINT64_C(4000) * SR_MHZ(1))
+
 /* Fastest rate in stream mode; anything above runs in buffer mode. */
 #define DL32_MAX_STREAM_RATE	SR_MHZ(100)
 

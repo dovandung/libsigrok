@@ -620,6 +620,12 @@ SR_PRIV void dl32_capture_plan(const struct dl32_capture *cap,
 			cap->num_totals >= ch_offset + num_channels) ?
 			ch + ch_offset : ch;
 		t = tidx < cap->num_totals ? cap->totals[tidx] : 0;
+		/* A total larger than what arrived is not usable; use the data. */
+		if (t > cap->chan[id]->len) {
+			sr_dbg("D%u: reported %" PRIu64 " bytes, received %u.",
+				ch, t, cap->chan[id]->len);
+			t = cap->chan[id]->len;
+		}
 		if (t && t * 8 > depth && t * 8 > pre_trigger + cap->trigger_offset)
 			plan->start[ch] = t * 8 - pre_trigger - cap->trigger_offset;
 		/*
@@ -1370,6 +1376,31 @@ SR_PRIV int dl32_start_acquisition(const struct sr_dev_inst *sdi)
 			devc->enabled_mask |= 1u << i;
 		codes[i] = (devc->enabled_mask & (1u << i)) ?
 			(codes[i] | DL32_TRIG_ENABLE) : 0;
+	}
+
+	/*
+	 * Buffer mode bandwidth: rate x captured channels must stay within the
+	 * device's budget, or it uploads unusable data. Measured on a DL32
+	 * Plus: 32 ch works at 250 MHz but not 400 MHz; 16 ch works at 400 MHz.
+	 */
+	if (devc->buffer_mode) {
+		unsigned int nen = 0;
+		uint64_t budget, max_rate;
+
+		for (i = 0; i < devc->num_channels; i++)
+			nen += (devc->enabled_mask >> i) & 1;
+		budget = devc->info.plus ? DL32_PLUS_BUDGET : DL32_BUDGET;
+		if (nen && devc->samplerate * nen > budget) {
+			max_rate = budget / nen;
+			sr_err("At %" PRIu64 " MHz the %s can capture at most %"
+				PRIu64 " channels in buffer mode (%u enabled). "
+				"Disable channels or use %" PRIu64 " MHz or less.",
+				devc->samplerate / SR_MHZ(1),
+				devc->info.plus ? "DL32 Plus" : "DL32",
+				budget / devc->samplerate, nen,
+				max_rate / SR_MHZ(1));
+			return SR_ERR_SAMPLERATE;
+		}
 	}
 
 	/* Samples requested from the device, and the pre-trigger position. */
