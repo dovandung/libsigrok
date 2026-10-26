@@ -310,10 +310,42 @@ static uint64_t read_le40(const uint8_t *p)
 	return v;
 }
 
+/*
+ * Try to read a frame at buf[0] with 'gap' bytes between header and payload.
+ * Returns 1 = frame, 0 = not a frame, -1 = need more data.
+ */
+static int frame_at(const uint8_t *buf, size_t len, size_t gap,
+	struct dl32_frame *frame)
+{
+	size_t plen, i;
+
+	plen = buf[2] | (buf[3] << 8);
+	if (4 + gap + plen + 2 > len)
+		return -1;
+	for (i = 0; i < gap; i++) {
+		if (buf[4 + i] != 0x00)
+			return 0;
+	}
+	if (buf[4 + gap + plen] != 0x00 || buf[5 + gap + plen] != 0x0b)
+		return 0;
+	frame->type = buf[1];
+	frame->payload = &buf[4 + gap];
+	frame->len = plen;
+	frame->size = 4 + gap + plen + 2;
+
+	return 1;
+}
+
+/*
+ * Frames are [0A][type][len16 LE][gap][payload (len)][00][0B]. The DL16 has
+ * no gap; the DL32 FPGA puts DL32_FRAME_GAP zero bytes after the header and
+ * pads data frames to 2 KiB. Both layouts are accepted, DL32 first.
+ */
 SR_PRIV enum dl32_parse_result dl32_parse_frame(const uint8_t *buf,
 	size_t len, size_t *skip, struct dl32_frame *frame)
 {
-	size_t i, plen;
+	size_t i;
+	int r32, r16;
 
 	for (i = 0; i < len; i++) {
 		if (buf[i] != 0x0a)
@@ -328,18 +360,20 @@ SR_PRIV enum dl32_parse_result dl32_parse_frame(const uint8_t *buf,
 			*skip = i;
 			return DL32_PARSE_NEED_MORE;
 		}
-		plen = buf[i + 2] | (buf[i + 3] << 8);
-		if (i + plen + 6 > len) {
+		r32 = frame_at(buf + i, len - i, DL32_FRAME_GAP, frame);
+		if (r32 == 1) {
+			*skip = i;
+			return DL32_PARSE_FRAME;
+		}
+		r16 = frame_at(buf + i, len - i, 0, frame);
+		if (r16 == 1) {
+			*skip = i;
+			return DL32_PARSE_FRAME;
+		}
+		if (r32 < 0 || r16 < 0) {
 			*skip = i;
 			return DL32_PARSE_NEED_MORE;
 		}
-		if (buf[i + 4 + plen] != 0x00 || buf[i + 5 + plen] != 0x0b)
-			continue;
-		*skip = i;
-		frame->type = buf[i + 1];
-		frame->payload = &buf[i + 4];
-		frame->len = plen;
-		return DL32_PARSE_FRAME;
 	}
 	*skip = len;
 
@@ -425,7 +459,7 @@ SR_PRIV int dl32_capture_feed(struct dl32_capture *cap,
 		cap->num_totals = MIN(rest / 5, DL32_TRIGGER_POSITIONS);
 		for (k = 0; k < cap->num_totals; k++)
 			cap->totals[k] = read_le40(p + 7 + 5 * k);
-		sr_dbg("Trigger offset %" PRIu64 ", %u channel totals%s%s.",
+		sr_info("Trigger offset %" PRIu64 ", %u channel totals%s%s.",
 			cap->trigger_offset, cap->num_totals,
 			cap->exceed_capacity ? ", over capacity" : "",
 			cap->exceed_bandwidth ? ", over bandwidth" : "");
@@ -436,7 +470,7 @@ SR_PRIV int dl32_capture_feed(struct dl32_capture *cap,
 			break;
 		sr_dbg("Ack for command 0x%02x: 0x%02x.", p[2], n > 3 ? p[3] : 0);
 		if (p[2] == DL32_CMD_TRIGGER && n > 3 && p[3] != 3) {
-			sr_warn("Device rejected the capture parameters (code %u).",
+			sr_dbg("Start acknowledged with code %u (DL16 uses 3).",
 				p[3]);
 			cap->ack_error = TRUE;
 		}
@@ -492,7 +526,7 @@ SR_PRIV size_t dl32_consume_frames(struct dl32_capture *cap,
 		}
 		log_frame(&frame);
 		dl32_capture_feed(cap, &frame);
-		pos += skip + frame.len + 6;
+		pos += skip + frame.size;
 	}
 
 	return pos;
@@ -540,6 +574,13 @@ SR_PRIV void dl32_capture_plan(const struct dl32_capture *cap,
 		t = tidx < cap->num_totals ? cap->totals[tidx] : 0;
 		if (t && t * 8 > depth && t * 8 > pre_trigger + cap->trigger_offset)
 			plan->start[ch] = t * 8 - pre_trigger - cap->trigger_offset;
+		/*
+		 * Keep a full window: if the reported offset would leave fewer
+		 * than 'depth' samples (e.g. an instant capture reporting 0),
+		 * use the last 'depth' samples instead.
+		 */
+		if (t && depth && t * 8 >= depth && plan->start[ch] > t * 8 - depth)
+			plan->start[ch] = t * 8 - depth;
 		if (t && t < min_total)
 			min_total = t;
 	}
@@ -1063,7 +1104,7 @@ static void feed_framed(const struct sr_dev_inst *sdi, const uint8_t *p,
 		return;
 	}
 
-	if (devc->capture->ack_error || devc->capture->done)
+	if (devc->capture->done)
 		dl32_abort_acquisition(devc);
 }
 
@@ -1128,8 +1169,6 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 			len < DL32_STATUS_MAX_LEN) {
 		/* Status frames arrive as their own short reads. */
 		dl32_consume_frames(devc->capture, p, len);
-		if (devc->capture->ack_error)
-			dl32_abort_acquisition(devc);
 	} else {
 		devc->data_started = TRUE;
 		feed_raw(sdi, p, len);

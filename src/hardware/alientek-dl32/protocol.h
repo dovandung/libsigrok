@@ -107,6 +107,9 @@
 #define DL32_FRAME_PROGRESS	5
 #define DL32_FRAME_DONE		6
 
+/* Zero bytes between frame header and payload on the DL32. */
+#define DL32_FRAME_GAP		10
+
 enum dl32_parse_result {
 	DL32_PARSE_FRAME,	/* A frame was found. */
 	DL32_PARSE_NEED_MORE,	/* A frame may start here; wait for more data. */
@@ -116,7 +119,8 @@ enum dl32_parse_result {
 struct dl32_frame {
 	uint8_t type;
 	const uint8_t *payload;
-	size_t len;
+	size_t len;	/* Payload length. */
+	size_t size;	/* Whole frame, header to trailer. */
 };
 
 /* Per-channel data collected in buffer / RLE mode, keyed by device channel id. */
