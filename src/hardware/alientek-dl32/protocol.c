@@ -162,7 +162,10 @@ SR_PRIV void dl32_build_trigger(uint8_t out[DL32_TRIGGER_LEN],
 		nib = codes[ch] & 0x0f;
 		out[pos / 2] |= (pos & 1) ? nib : (uint8_t)(nib << 4);
 	}
-	/* out[16], out[17]: collect type flags, both 0 for a normal run. */
+	/*
+	 * out[16]: loop capture, out[17]: instant capture (no trigger wait).
+	 * Both 0 = single capture that waits for the trigger.
+	 */
 }
 
 /*
@@ -1113,6 +1116,11 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	len = transfer->actual_length;
 	if (devc->dump)
 		fwrite(p, 1, len, devc->dump);
+	if (sr_log_loglevel_get() >= SR_LOG_SPEW) {
+		GString *str = sr_hexdump_new(p, MIN(len, 16));
+		sr_spew("Read %zu bytes: %s", len, str->str);
+		sr_hexdump_free(str);
+	}
 
 	if (devc->framed) {
 		feed_framed(sdi, p, len);
@@ -1304,6 +1312,13 @@ SR_PRIV int dl32_start_acquisition(const struct sr_dev_inst *sdi)
 		threshold_tenths[devc->threshold_idx], hz_index,
 		device_samples, trigger_pos);
 	dl32_build_trigger(trig, codes, devc->num_channels, devc->ch_offset);
+	/*
+	 * Without a trigger, buffer mode must be told to capture at once
+	 * ("instant" in ATK-Logic); otherwise the device arms and waits.
+	 * Stream mode ignores this (verified with the flag clear).
+	 */
+	if (devc->buffer_mode && !devc->hw_trigger)
+		trig[DL32_TRIGGER_INSTANT] = 1;
 
 	if (sr_log_loglevel_get() >= SR_LOG_DBG) {
 		GString *ps = sr_hexdump_new(params, sizeof(params));

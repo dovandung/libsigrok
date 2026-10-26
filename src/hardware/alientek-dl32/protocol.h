@@ -59,6 +59,8 @@
 #define DL32_PARAMS_LEN		13
 #define DL32_TRIGGER_LEN	18
 #define DL32_TRIGGER_POSITIONS	32
+#define DL32_TRIGGER_LOOP	16	/* Byte index: loop capture flag. */
+#define DL32_TRIGGER_INSTANT	17	/* Byte index: capture without trigger. */
 
 /*
  * Stream data arrives as groups of one 2016 byte block per channel.
