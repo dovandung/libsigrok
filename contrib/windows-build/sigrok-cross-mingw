@@ -254,8 +254,11 @@ cd libsigrok
 ./configure $C $L
 make $PARALLEL $V
 make install $V
-# Show which of the added drivers were built ('' = yes, '#' = no).
-grep -E "^HW_(SIPEED_SLOGIC_ANALYZER|CYPRESS_FX3_16|CYPRESS_FX3_8|HSDAOH_LA|FX2LAFW)_TRUE=" config.log || true
+# List every driver that was built (HW_<driver>_TRUE='' in config.log).
+$ECHO "libsigrok drivers built:"
+sed -n "s/^HW_\(.*\)_TRUE=''$/  \1/p" config.log | tr 'A-Z_' 'a-z-'
+$ECHO "libsigrok drivers left out:"
+sed -n "s/^HW_\(.*\)_TRUE='#'$/  \1/p" config.log | tr 'A-Z_' 'a-z-'
 cd ..
 
 # libsigrokdecode
