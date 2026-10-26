@@ -25,12 +25,14 @@
 /*
  * Channel layouts. The trigger/enable positions are the physical inputs:
  * position 0 is CH0 (confirmed on a DL32 Plus, where data channel ids
- * follow the enabled positions). The default captures CH0-CH15 as D0-D15.
- * "logic_channels=32" captures CH0-CH31. ALIENTEK_DL32_OFFSET=<n> shifts
- * the 16-channel window to start at CH<n> (ATK-Logic uses 8 for some DL32
- * models).
+ * follow the enabled positions). By default the DL32 Plus shows all 32
+ * inputs (D0-D31 = CH0-CH31; tested in stream and buffer mode) and the
+ * plain DL32 shows CH0-CH15. "logic_channels=16|32" overrides that, and
+ * ALIENTEK_DL32_OFFSET=<n> selects a 16-channel window starting at CH<n>
+ * (ATK-Logic uses 8 for some DL32 models).
  */
 #define DEFAULT_CHANNELS	16
+#define PLUS_CHANNELS		32
 #define DEFAULT_CH_OFFSET	0
 
 static const uint32_t scanopts[] = {
@@ -75,15 +77,16 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 	GSList *devices, *conn_devices, *l;
 	const char *conn;
 	char connection_id[64], name[8];
-	unsigned int num_channels, ch_offset, i, j;
+	unsigned int num_channels, nch, ch_offset, i, j;
 	int ret;
 
 	drvc = di->context;
 	devices = NULL;
 	conn = NULL;
-	num_channels = DEFAULT_CHANNELS;
+	num_channels = 0; /* Automatic: depends on the model. */
 	ch_offset = DEFAULT_CH_OFFSET;
 	if (g_getenv("ALIENTEK_DL32_OFFSET")) {
+		num_channels = DEFAULT_CHANNELS;
 		ch_offset = atoi(g_getenv("ALIENTEK_DL32_OFFSET"));
 		if (ch_offset > DL32_TRIGGER_POSITIONS - DEFAULT_CHANNELS ||
 				ch_offset % 2) {
@@ -106,7 +109,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 			break;
 		}
 	}
-	if (num_channels != 16 && num_channels != 32) {
+	if (num_channels && num_channels != 16 && num_channels != 32) {
 		sr_err("logic_channels must be 16 or 32.");
 		return NULL;
 	}
@@ -183,15 +186,17 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		sdi->conn = sr_usb_dev_inst_new(libusb_get_bus_number(devlist[i]),
 			libusb_get_device_address(devlist[i]), NULL);
 
-		for (j = 0; j < num_channels; j++) {
+		nch = num_channels ? num_channels :
+			info.plus ? PLUS_CHANNELS : DEFAULT_CHANNELS;
+		for (j = 0; j < nch; j++) {
 			g_snprintf(name, sizeof(name), "D%u", j);
 			sr_channel_new(sdi, j, SR_CHANNEL_LOGIC, TRUE, name);
 		}
 
 		devc = g_malloc0(sizeof(*devc));
 		devc->info = info;
-		devc->num_channels = num_channels;
-		devc->ch_offset = num_channels == 32 ? 0 : ch_offset;
+		devc->num_channels = nch;
+		devc->ch_offset = nch == 32 ? 0 : ch_offset;
 		devc->samplerate = SR_MHZ(10);
 		devc->limit_samples = SR_MHZ(1);
 		devc->capture_ratio = 10;
