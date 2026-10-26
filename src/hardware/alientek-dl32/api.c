@@ -18,17 +18,20 @@
  */
 
 #include <config.h>
+#include <stdlib.h>
 #include <string.h>
 #include "protocol.h"
 
 /*
- * Channel layouts. 16 channels at offset 8 is what ATK-Logic uses for the
- * DL32 in stream mode and is verified on hardware. 32 channels (offset 0)
- * is a guess for the full input set; select it with the scan option
- * "logic_channels=32" and check that the data makes sense.
+ * Channel layouts. The trigger/enable positions are the physical inputs:
+ * position 0 is CH0 (confirmed on a DL32 Plus, where data channel ids
+ * follow the enabled positions). The default captures CH0-CH15 as D0-D15.
+ * "logic_channels=32" captures CH0-CH31. ALIENTEK_DL32_OFFSET=<n> shifts
+ * the 16-channel window to start at CH<n> (ATK-Logic uses 8 for some DL32
+ * models).
  */
 #define DEFAULT_CHANNELS	16
-#define DEFAULT_CH_OFFSET	8
+#define DEFAULT_CH_OFFSET	0
 
 static const uint32_t scanopts[] = {
 	SR_CONF_CONN,
@@ -72,13 +75,25 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 	GSList *devices, *conn_devices, *l;
 	const char *conn;
 	char connection_id[64], name[8];
-	unsigned int num_channels, i, j;
+	unsigned int num_channels, ch_offset, i, j;
 	int ret;
 
 	drvc = di->context;
 	devices = NULL;
 	conn = NULL;
 	num_channels = DEFAULT_CHANNELS;
+	ch_offset = DEFAULT_CH_OFFSET;
+	if (g_getenv("ALIENTEK_DL32_OFFSET")) {
+		ch_offset = atoi(g_getenv("ALIENTEK_DL32_OFFSET"));
+		if (ch_offset > DL32_TRIGGER_POSITIONS - DEFAULT_CHANNELS ||
+				ch_offset % 2) {
+			sr_err("ALIENTEK_DL32_OFFSET must be even and at most %d.",
+				DL32_TRIGGER_POSITIONS - DEFAULT_CHANNELS);
+			return NULL;
+		}
+		sr_info("Capturing CH%u-CH%u.", ch_offset,
+			ch_offset + DEFAULT_CHANNELS - 1);
+	}
 
 	for (l = options; l; l = l->next) {
 		struct sr_config *src = l->data;
@@ -176,7 +191,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		devc = g_malloc0(sizeof(*devc));
 		devc->info = info;
 		devc->num_channels = num_channels;
-		devc->ch_offset = num_channels == 32 ? 0 : DEFAULT_CH_OFFSET;
+		devc->ch_offset = num_channels == 32 ? 0 : ch_offset;
 		devc->samplerate = SR_MHZ(10);
 		devc->limit_samples = SR_MHZ(1);
 		devc->capture_ratio = 10;
