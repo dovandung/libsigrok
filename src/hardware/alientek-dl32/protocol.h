@@ -67,6 +67,9 @@
 #define DL32_BLOCK_BYTES	2016
 #define DL32_BLOCK_SAMPLES	(DL32_BLOCK_BYTES * 8)
 
+/* Size of synchronous reads: a whole number of packets at any USB speed. */
+#define DL32_READ_LEN		(64 * 1024)
+
 /* Short reads that start with 0x0A before any data are status packets. */
 #define DL32_STATUS_MAX_LEN	4096
 

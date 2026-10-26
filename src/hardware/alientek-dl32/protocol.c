@@ -615,6 +615,12 @@ static int usb_write(libusb_device_handle *hdl, const uint8_t *buf, int len)
 	return SR_OK;
 }
 
+/*
+ * Bulk IN read. Always read into buffers of whole packets (DL32_READ_LEN):
+ * with WinUSB, a buffer smaller than the device's packet (1024 bytes on
+ * USB 3) makes the transfer fail instead of returning the data.
+ * Returns the byte count (0 on timeout) or -1 on error.
+ */
 static int usb_read(libusb_device_handle *hdl, uint8_t *buf, int len,
 	unsigned int timeout_ms)
 {
@@ -622,10 +628,50 @@ static int usb_read(libusb_device_handle *hdl, uint8_t *buf, int len,
 
 	done = 0;
 	ret = libusb_bulk_transfer(hdl, DL32_EP_IN, buf, len, &done, timeout_ms);
-	if (ret != 0 && ret != LIBUSB_ERROR_TIMEOUT)
-		return -1;
+	if (ret == 0 || ret == LIBUSB_ERROR_TIMEOUT)
+		return done;
+	if (ret == LIBUSB_ERROR_OVERFLOW && done > 0) {
+		sr_dbg("Read overflow after %d bytes.", done);
+		return done;
+	}
 
-	return done;
+	sr_warn("USB read failed: %s.", libusb_error_name(ret));
+	if (ret == LIBUSB_ERROR_PIPE)
+		libusb_clear_halt(hdl, DL32_EP_IN);
+
+	return -1;
+}
+
+/*
+ * Read until a reply starting with prefix shows up (anywhere in a read, so
+ * stale bytes in front of it do not matter) or timeout_ms passes.
+ * On success the reply is moved to the start of buf and its length returned.
+ */
+static int read_reply(libusb_device_handle *hdl, uint8_t *buf,
+	const uint8_t *prefix, size_t prefix_len, unsigned int timeout_ms)
+{
+	gint64 deadline;
+	int n, i;
+
+	deadline = g_get_monotonic_time() + (gint64)timeout_ms * 1000;
+	do {
+		n = usb_read(hdl, buf, DL32_READ_LEN, 100);
+		if (n < 0)
+			return -1;
+		for (i = 0; i + (int)prefix_len <= n; i++) {
+			if (!memcmp(buf + i, prefix, prefix_len)) {
+				memmove(buf, buf + i, n - i);
+				return n - i;
+			}
+		}
+		if (n > 0 && sr_log_loglevel_get() >= SR_LOG_DBG) {
+			GString *str = sr_hexdump_new(buf, MIN(n, 16));
+			sr_dbg("Skipping %d unexpected bytes: %s", n, str->str);
+			sr_hexdump_free(str);
+		}
+	} while (g_get_monotonic_time() < deadline);
+
+	return 0;
 }
 
 /* Discard anything still queued in the device (e.g. a previous stream). */
@@ -635,10 +681,10 @@ static void usb_drain(libusb_device_handle *hdl)
 	int i, n;
 	size_t total;
 
-	buf = g_malloc(64 * 1024);
+	buf = g_malloc(DL32_READ_LEN);
 	total = 0;
 	for (i = 0; i < 4096; i++) {
-		n = usb_read(hdl, buf, 64 * 1024, 50);
+		n = usb_read(hdl, buf, DL32_READ_LEN, 50);
 		if (n <= 0)
 			break;
 		total += n;
@@ -673,38 +719,44 @@ static int send_framed(libusb_device_handle *hdl, uint8_t cmd,
 
 SR_PRIV int dl32_identify(libusb_device_handle *hdl, struct dl32_info *info)
 {
-	uint8_t buf[0x800];
-	int n;
+	static const uint8_t hello_prefix[] = { 0x0a, DL32_RAW_CMD_HELLO, 0x01 };
+	static const uint8_t info_prefix[] = { 0x0a, DL32_FRAME_INFO };
+	uint8_t *buf;
+	int n, attempt, ret;
 
 	memset(info, 0, sizeof(*info));
-	usb_drain(hdl);
+	buf = g_malloc(DL32_READ_LEN);
+	ret = SR_ERR;
 
-	if (send_raw(hdl, DL32_RAW_CMD_HELLO, NULL, 0) != SR_OK) {
-		sr_warn("Could not send the hello command.");
-		return SR_ERR;
-	}
-	n = usb_read(hdl, buf, 512, 300);
-	if (n <= 0 || !dl32_parse_hello(buf, n, info)) {
-		if (n > 0) {
-			GString *s = sr_hexdump_new(buf, MIN(n, 16));
-			sr_warn("Unexpected hello reply (%d bytes): %s", n, s->str);
-			sr_hexdump_free(s);
-		} else {
-			sr_warn("No reply to the hello command (%s).",
-				n < 0 ? "read error" : "timeout");
+	/* The first exchange after opening sometimes gets lost; retry. */
+	n = 0;
+	for (attempt = 1; attempt <= 3; attempt++) {
+		usb_drain(hdl);
+		if (send_raw(hdl, DL32_RAW_CMD_HELLO, NULL, 0) != SR_OK) {
+			sr_warn("Could not send the hello command (attempt %d).",
+				attempt);
+			continue;
 		}
-		return SR_ERR;
+		n = read_reply(hdl, buf, ARRAY_AND_SIZE(hello_prefix), 500);
+		if (n > 0 && dl32_parse_hello(buf, n, info))
+			break;
+		sr_warn("No valid hello reply (attempt %d, %s).", attempt,
+			n < 0 ? "read error" : "timeout");
+		n = 0;
 	}
+	if (n <= 0)
+		goto out;
+
 	sr_dbg("Hello: mode '%c', MCU %d, variant %d, plus %d.",
 		info->mode, info->mcu_version, info->variant, info->plus);
 	if (info->mode != 'a') {
 		sr_err("Device is not in application mode (mode 0x%02x); "
 			"update its firmware with ATK-Logic first.", info->mode);
-		return SR_ERR;
+		goto out;
 	}
 
 	if (send_framed(hdl, DL32_CMD_DEVICE_DATA, NULL, 0) == SR_OK) {
-		n = usb_read(hdl, buf, sizeof(buf), 300);
+		n = read_reply(hdl, buf, ARRAY_AND_SIZE(info_prefix), 500);
 		if (n > 0) {
 			dl32_parse_name(buf, n, info);
 			if (sr_log_loglevel_get() >= SR_LOG_SPEW) {
@@ -718,8 +770,11 @@ SR_PRIV int dl32_identify(libusb_device_handle *hdl, struct dl32_info *info)
 		g_strlcpy(info->name, "DL32", sizeof(info->name));
 
 	usb_drain(hdl);
+	ret = SR_OK;
+out:
+	g_free(buf);
 
-	return SR_OK;
+	return ret;
 }
 
 SR_PRIV void dl32_send_stop(libusb_device_handle *hdl)
@@ -1136,7 +1191,7 @@ SR_PRIV int dl32_start_acquisition(const struct sr_dev_inst *sdi)
 	const GSList *l;
 	uint8_t params[DL32_PARAMS_LEN], trig[DL32_TRIGGER_LEN];
 	uint8_t codes[DL32_TRIGGER_POSITIONS];
-	uint8_t one = 1, reply[512];
+	uint8_t one = 1, *reply;
 	uint64_t limit, device_samples, trigger_pos, groups;
 	const char *dump_path;
 	size_t xfer_size;
@@ -1269,7 +1324,9 @@ SR_PRIV int dl32_start_acquisition(const struct sr_dev_inst *sdi)
 	usb_drain(usb->devhdl);
 	if (send_raw(usb->devhdl, DL32_RAW_CMD_RESET, &one, 1) != SR_OK)
 		goto err_free;
-	usb_read(usb->devhdl, reply, sizeof(reply), 200);
+	reply = g_malloc(DL32_READ_LEN);
+	usb_read(usb->devhdl, reply, DL32_READ_LEN, 200);
+	g_free(reply);
 	usb_drain(usb->devhdl);
 
 	/* Queue reads before starting so no data is lost at high rates. */
