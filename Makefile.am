@@ -242,6 +242,12 @@ src_libdrivers_la_SOURCES += \
 	src/hardware/agilent-dmm/protocol.c \
 	src/hardware/agilent-dmm/api.c
 endif
+if HW_ALIENTEK_DL32
+src_libdrivers_la_SOURCES += \
+	src/hardware/alientek-dl32/protocol.h \
+	src/hardware/alientek-dl32/protocol.c \
+	src/hardware/alientek-dl32/api.c
+endif
 if HW_APPA_55II
 src_libdrivers_la_SOURCES += \
 	src/hardware/appa-55ii/protocol.h \
