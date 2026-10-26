@@ -118,18 +118,30 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		}
 
 		if (usb_get_port_path(devlist[i], connection_id,
-				sizeof(connection_id)) < 0)
+				sizeof(connection_id)) < 0) {
+			sr_err("Cannot get the USB port path of a %04x:%04x "
+				"device.", des.idVendor, des.idProduct);
 			continue;
+		}
+		sr_info("Checking %04x:%04x at %s.", des.idVendor,
+			des.idProduct, connection_id);
 
 		/* 04b4:6a6a is a Cypress FX3 ID; confirm it is a DL32. */
 		if ((ret = libusb_open(devlist[i], &hdl)) != 0) {
-			sr_warn("Cannot open %s: %s.", connection_id,
-				libusb_error_name(ret));
+			if (ret == LIBUSB_ERROR_NOT_SUPPORTED)
+				sr_err("Found a DL32 at %s, but it uses a driver "
+					"libusb cannot open (probably Cypress "
+					"cyusb3 from ATK-Logic). Switch it to "
+					"WinUSB with Zadig.", connection_id);
+			else
+				sr_err("Found a DL32 at %s, but cannot open it: %s.",
+					connection_id, libusb_error_name(ret));
 			continue;
 		}
 		libusb_set_auto_detach_kernel_driver(hdl, 1);
 		if ((ret = libusb_claim_interface(hdl, DL32_USB_INTERFACE)) != 0) {
-			sr_warn("Cannot claim %s: %s (in use by another program?).",
+			sr_err("Cannot claim the DL32 at %s: %s (close ATK-Logic "
+				"or any other program using it).",
 				connection_id, libusb_error_name(ret));
 			libusb_close(hdl);
 			continue;
@@ -137,8 +149,12 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		ret = dl32_identify(hdl, &info);
 		libusb_release_interface(hdl, DL32_USB_INTERFACE);
 		libusb_close(hdl);
-		if (ret != SR_OK)
+		if (ret != SR_OK) {
+			sr_err("Device %04x:%04x at %s did not answer as a DL32; "
+				"run with -l 5 for details.", des.idVendor,
+				des.idProduct, connection_id);
 			continue;
+		}
 
 		sdi = g_malloc0(sizeof(*sdi));
 		sdi->status = SR_ST_INACTIVE;

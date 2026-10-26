@@ -679,11 +679,20 @@ SR_PRIV int dl32_identify(libusb_device_handle *hdl, struct dl32_info *info)
 	memset(info, 0, sizeof(*info));
 	usb_drain(hdl);
 
-	if (send_raw(hdl, DL32_RAW_CMD_HELLO, NULL, 0) != SR_OK)
+	if (send_raw(hdl, DL32_RAW_CMD_HELLO, NULL, 0) != SR_OK) {
+		sr_warn("Could not send the hello command.");
 		return SR_ERR;
+	}
 	n = usb_read(hdl, buf, 512, 300);
 	if (n <= 0 || !dl32_parse_hello(buf, n, info)) {
-		sr_dbg("No valid hello reply (%d bytes).", n);
+		if (n > 0) {
+			GString *s = sr_hexdump_new(buf, MIN(n, 16));
+			sr_warn("Unexpected hello reply (%d bytes): %s", n, s->str);
+			sr_hexdump_free(s);
+		} else {
+			sr_warn("No reply to the hello command (%s).",
+				n < 0 ? "read error" : "timeout");
+		}
 		return SR_ERR;
 	}
 	sr_dbg("Hello: mode '%c', MCU %d, variant %d, plus %d.",
