@@ -52,8 +52,18 @@ static const uint32_t devopts[] = {
 	SR_CONF_LIMIT_SAMPLES | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_LIMIT_MSEC | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_LOGIC_THRESHOLD | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_VOLTAGE_THRESHOLD | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_TRIGGER_MATCH | SR_CONF_LIST,
 	SR_CONF_CAPTURE_RATIO | SR_CONF_GET | SR_CONF_SET,
+};
+
+/*
+ * The same presets as dl32_thresholds[] (same order), as the switching
+ * voltage. PulseView only shows thresholds in this form.
+ */
+static const double volt_thresholds[][2] = {
+	{ 2.5, 2.5 }, { 1.6, 1.6 }, { 1.5, 1.5 }, { 1.2, 1.2 },
+	{ 0.9, 0.9 }, { 0.7, 0.7 }, { 0.6, 0.6 },
 };
 
 static const int32_t trigger_matches[] = {
@@ -283,6 +293,10 @@ static int config_get(uint32_t key, GVariant **data,
 	case SR_CONF_LOGIC_THRESHOLD:
 		*data = g_variant_new_string(dl32_thresholds[devc->threshold_idx]);
 		break;
+	case SR_CONF_VOLTAGE_THRESHOLD:
+		*data = std_gvar_tuple_double(volt_thresholds[devc->threshold_idx][0],
+			volt_thresholds[devc->threshold_idx][1]);
+		break;
 	case SR_CONF_CAPTURE_RATIO:
 		*data = g_variant_new_uint64(devc->capture_ratio);
 		break;
@@ -326,6 +340,12 @@ static int config_set(uint32_t key, GVariant *data,
 			return SR_ERR_ARG;
 		devc->threshold_idx = idx;
 		break;
+	case SR_CONF_VOLTAGE_THRESHOLD:
+		if ((idx = std_double_tuple_idx(data,
+				ARRAY_AND_SIZE(volt_thresholds))) < 0)
+			return SR_ERR_ARG;
+		devc->threshold_idx = idx;
+		break;
 	case SR_CONF_CAPTURE_RATIO:
 		devc->capture_ratio = g_variant_get_uint64(data);
 		break;
@@ -355,6 +375,9 @@ static int config_list(uint32_t key, GVariant **data,
 		break;
 	case SR_CONF_LOGIC_THRESHOLD:
 		*data = std_gvar_array_str(dl32_thresholds, dl32_num_thresholds);
+		break;
+	case SR_CONF_VOLTAGE_THRESHOLD:
+		*data = std_gvar_thresholds(ARRAY_AND_SIZE(volt_thresholds));
 		break;
 	case SR_CONF_TRIGGER_MATCH:
 		*data = std_gvar_array_i32(ARRAY_AND_SIZE(trigger_matches));
