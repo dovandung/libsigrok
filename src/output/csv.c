@@ -188,7 +188,13 @@ static int init(struct sr_output *o, GHashTable *options)
 		* (ctx->num_analog_channels + ctx->num_logic_channels));
 
 	/* Once more to map the enabled channels. */
-	ctx->channel_count = g_slist_length(o->sdi->channels);
+	/*
+	 * Count only the enabled channels: disabled ones never arrive in a
+	 * packet. With all channels (e.g. the wch-ch32h417 driver's two disabled
+	 * analog channels) a dump came only every second logic packet and the
+	 * second packet overwrote the first one's samples.
+	 */
+	ctx->channel_count = ctx->num_logic_channels + ctx->num_analog_channels;
 	for (i = 0, l = o->sdi->channels; l; l = l->next) {
 		ch = l->data;
 		if (ch->enabled) {
@@ -382,7 +388,7 @@ static void process_logic(struct context *ctx,
 	uint8_t *sample;
 
 	num_samples = logic->length / logic->unitsize;
-	ctx->channels_seen += ctx->logic_channel_count;
+	ctx->channels_seen += ctx->num_logic_channels;
 	sr_dbg("Logic packet had %d channels", logic->unitsize * 8);
 	if (!ctx->logic_samples) {
 		ctx->logic_samples = g_malloc(num_samples * ctx->num_logic_channels);
